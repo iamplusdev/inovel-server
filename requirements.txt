@@ -3,3 +3,6 @@ fastapi>=0.110,<1.0
 uvicorn>=0.27,<1.0
 sqlalchemy>=2.0,<3.0
 python-multipart>=0.0.9,<1.0
+# 在线搜索：执行 Legado 书源的 CSS / XPath 规则（soupsieve 随 bs4 安装）
+beautifulsoup4>=4.12,<5.0
+lxml>=5.0,<7.0

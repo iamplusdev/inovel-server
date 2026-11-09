@@ -129,6 +129,15 @@ def book_list_item(book: Book, base: str | None = None) -> dict:
         "status": book.status,
         "source": getattr(book, "source", "") or "",
         "source_id": getattr(book, "source_id", "") or "",
+        # 在线搜索登记进来的书（无本地正文）：source_path 统一以 online: 开头，
+        # 前端据此显示「在线」角标并禁用阅读器入口，避免点进空目录
+        "online": str(getattr(book, "source_path", "") or "").startswith("online:"),
+        # 在线书的原站地址（给「去原书源阅读」用）；本地书为空
+        "book_url": (
+            str(book.source_path)[len("online:") :]
+            if str(getattr(book, "source_path", "") or "").startswith("online:")
+            else ""
+        ),
         "cover_path": cover_rel(book),
         "cover_url": cover_abs(book, root),
         # 列表卡片优先用缩略图，减少原图流量（服务端按需生成）

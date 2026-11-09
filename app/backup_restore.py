@@ -730,10 +730,13 @@ def server_item(book: Book, base: str = "", state: dict | None = None) -> dict:
         rows = [r for r in state["shelf_books"] if r.book_id == int(book.id)]
     rows = rows or []
     item["origin"] = "both" if rows else "server"
-    item["readable"] = True
+    # 在线搜索登记的书没有本地正文，不能进阅读器
+    item["readable"] = not item.get("online", False)
     item["shelf_id"] = int(rows[0].id) if rows else None
     item["source_name"] = rows[0].origin_name if rows else ""
-    item["book_url"] = rows[0].book_url if rows else ""
+    # 有手机书架记录时用书架里的原始地址；在线搜索登记的书沿用书目自带的 book_url
+    if rows:
+        item["book_url"] = rows[0].book_url
     return item
 
 
@@ -827,11 +830,12 @@ def merged_books(
     page_size = min(200, max(1, page_size))
     sliced = items[(page - 1) * page_size : page * page_size]
     if fields:
-        sliced = [filter_book_fields(i, fields) for i in sliced]
-    # 这几个标记是客户端判断「能不能读」的依据，裁剪 fields 后仍需保留
+        # origin/readable/online 是客户端判断「能不能读」的依据，裁剪后必须保留
+        sliced = [filter_book_fields(i, f"{fields},origin,readable,online") for i in sliced]
     for item in sliced:
         item.setdefault("origin", "server")
         item.setdefault("readable", True)
+        item.setdefault("online", False)
     return {
         "total": total,
         "page": page,

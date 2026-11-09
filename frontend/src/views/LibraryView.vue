@@ -8,6 +8,8 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { SOURCE_OPTS, useLibraryStore } from "@/stores/library";
 import { batchDeleteBooks, batchUpdateBooks, fetchBooks, pullAllBookProgress } from "@/api/admin";
 import { fetchShelfBook } from "@/api/shelf";
+import { addOnlineBook, fetchOnlineSources, searchOnline } from "@/api/online";
+import type { OnlineItem, OnlineSourceOption, OnlineSourceRef, OnlineSourceStatus } from "@/api/online";
 import type { BatchUpdateBody } from "@/api/admin";
 import { startBatchScrape } from "@/api/progress";
 import type { BookListItem } from "@/api/types";
@@ -111,6 +113,100 @@ function onOriginClick(value: string) {
   void lib.applyFilter({ origin: value });
 }
 
+// ------------------------------ 在线搜索 ------------------------------
+/** local=搜书库内书籍；online=用已导入的 Legado 书源在服务端检索 */
+const searchMode = ref<"local" | "online">("local");
+const onlineLoading = ref(false);
+const onlineError = ref("");
+const onlineItems = ref<OnlineItem[]>([]);
+const onlineStatus = ref<OnlineSourceStatus[]>([]);
+const onlineSources = ref<OnlineSourceOption[]>([]);
+/** 限定搜索范围；空数组=全部可用书源 */
+const onlinePicked = ref<number[]>([]);
+/** 正在加入书库的条目键："书名|源ID"，用于按钮 loading */
+const addingKey = ref("");
+
+const onlineSourceNames = computed(() => onlineSources.value.map((s) => s.name).join("、"));
+
+function switchMode(mode: "local" | "online") {
+  if (searchMode.value === mode) return;
+  searchMode.value = mode;
+  if (mode === "online") {
+    if (!onlineSources.value.length) void loadOnlineSources();
+    if (searchInput.value.trim() && !onlineItems.value.length) void runOnlineSearch();
+  }
+}
+
+async function loadOnlineSources() {
+  try {
+    const data = await fetchOnlineSources();
+    onlineSources.value = data.items || [];
+    if (!onlineSources.value.length) {
+      onlineError.value = "还没有可用于搜索的书源，请先到「书源管理」导入 Legado 书源。";
+    }
+  } catch {
+    onlineError.value = "书源列表加载失败";
+  }
+}
+
+async function runOnlineSearch() {
+  const q = searchInput.value.trim();
+  if (!q) {
+    ElMessage.warning("请输入要搜索的书名或作者");
+    return;
+  }
+  onlineLoading.value = true;
+  onlineError.value = "";
+  try {
+    const data = await searchOnline({
+      q,
+      source_ids: onlinePicked.value.length ? onlinePicked.value : undefined,
+    });
+    onlineItems.value = data.items || [];
+    onlineStatus.value = data.sources || [];
+    if (!data.items.length) {
+      onlineError.value = data.hint || "没有搜到结果，换个关键词或检查书源是否可用";
+    }
+  } catch (err) {
+    onlineItems.value = [];
+    onlineStatus.value = [];
+    onlineError.value = err instanceof Error ? err.message : "在线搜索失败";
+  } finally {
+    onlineLoading.value = false;
+  }
+}
+
+function toggleOnlinePicked(id: number) {
+  const idx = onlinePicked.value.indexOf(id);
+  if (idx >= 0) onlinePicked.value.splice(idx, 1);
+  else onlinePicked.value.push(id);
+}
+
+async function onAddOnline(item: OnlineItem, src: OnlineSourceRef) {
+  const key = `${item.name}|${src.source_id}`;
+  if (addingKey.value) return;
+  addingKey.value = key;
+  try {
+    const res = await addOnlineBook({
+      source_id: src.source_id,
+      name: item.name,
+      author: item.author,
+      book_url: src.book_url,
+      cover_url: src.cover_url || item.cover_url,
+      intro: src.intro || item.intro,
+      kind: src.kind || item.kind,
+      last_chapter: src.last_chapter || item.last_chapter,
+      word_count: item.word_count,
+    });
+    ElMessage.success(res.created ? `已加入书库：${res.title}` : `已在书库中：${res.title}`);
+    void lib.loadBooks();
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "加入书库失败");
+  } finally {
+    addingKey.value = "";
+  }
+}
+
 const gridStyle = computed(() => {
   if (viewMode.value === "list") {
     return { gridTemplateColumns: "1fr" };
@@ -172,10 +268,21 @@ function onViewModeChange(mode: "grid" | "list") {
 }
 
 function onSearchInput() {
+  // 在线模式不自动搜（每次搜索要打多个外部站点），回车或点按钮才触发
+  if (searchMode.value !== "local") return;
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
     void lib.applyFilter({ q: searchInput.value.trim() });
   }, 300);
+}
+
+function onSearchEnter() {
+  if (searchMode.value === "online") {
+    void runOnlineSearch();
+    return;
+  }
+  clearTimeout(searchTimer);
+  void lib.applyFilter({ q: searchInput.value.trim() });
 }
 
 function onSourceClick(src: string) {
@@ -280,8 +387,20 @@ watch(
 );
 
 function openBook(id: number) {
-  // 负数 id = 仅 Legado 的在线书，服务端没有正文，展示信息而不是进编辑页
   const book = lib.items.find((b) => b.id === id);
+  // 在线搜索登记进来的书：书库有记录但没有正文，进详情页只会看到空目录
+  if (book?.online) {
+    const link = book.book_url ? `\n原书地址：${book.book_url}` : "";
+    void ElMessageBox.alert(
+      `《${book.name}》是在线搜索登记的书，服务端还没有正文文件。\n可在原书源（${
+        book.source || "未知书源"
+      }）继续阅读。${link}`,
+      "在线书",
+      { confirmButtonText: "知道了", type: "info" },
+    );
+    return;
+  }
+  // 负数 id = 仅 Legado 的在线书，服务端没有正文，展示信息而不是进编辑页
   if (book && book.readable === false) {
     void showOnlineBook(book);
     return;
@@ -509,16 +628,48 @@ function onResize() {
         <span class="count-pill">{{ lib.total }} 本</span>
       </div>
       <div class="page-actions">
+        <div class="mode-toggle" role="group" aria-label="搜索范围">
+          <button
+            type="button"
+            class="mode-btn"
+            :class="{ 'is-active': searchMode === 'local' }"
+            @click="switchMode('local')"
+          >
+            本地
+          </button>
+          <button
+            type="button"
+            class="mode-btn"
+            :class="{ 'is-active': searchMode === 'online' }"
+            @click="switchMode('online')"
+          >
+            在线
+          </button>
+        </div>
+
         <div class="search-box">
           <AppIcon name="search" :size="16" />
           <input
             v-model="searchInput"
             type="search"
             class="search-input"
-            placeholder="搜索书名 / 作者 / 标签…"
+            :placeholder="
+              searchMode === 'online'
+                ? '用书源搜索书名 / 作者，回车开始'
+                : '搜索书名 / 作者 / 标签…'
+            "
             @input="onSearchInput"
-            @keyup.enter="void lib.applyFilter({ q: searchInput.trim() })"
+            @keyup.enter="onSearchEnter"
           />
+          <button
+            v-if="searchMode === 'online'"
+            type="button"
+            class="search-go"
+            :disabled="onlineLoading"
+            @click="runOnlineSearch"
+          >
+            {{ onlineLoading ? "搜索中" : "搜索" }}
+          </button>
         </div>
 
         <select
@@ -569,11 +720,12 @@ function onResize() {
       </div>
     </header>
 
-    <div v-if="loadError || lib.error" class="load-error" role="alert">
+    <div v-if="(loadError || lib.error) && searchMode === 'local'" class="load-error" role="alert">
       <span>{{ loadError || lib.error }}</span>
       <button type="button" class="ghost-btn" @click="loadAll">重试</button>
     </div>
 
+    <template v-if="searchMode === 'local'">
     <!-- 继续阅读：无筛选时展示最近在读的书，点击直接续读 -->
     <section
       v-if="showContinueRow && continueItems.length"
@@ -750,6 +902,87 @@ function onResize() {
         下一页
       </button>
     </div>
+    </template>
+
+    <!-- 在线搜索：用已导入的 Legado 书源检索，可登记进书库 -->
+    <section v-else class="online-panel">
+      <div class="online-toolbar">
+        <div class="online-scope">
+          <span class="muted-xs">搜索范围</span>
+          <button
+            type="button"
+            class="chip"
+            :class="{ 'is-active': !onlinePicked.length }"
+            @click="onlinePicked = []"
+          >
+            全部书源（{{ onlineSources.length }}）
+          </button>
+          <button
+            v-for="src in onlineSources"
+            :key="src.id"
+            type="button"
+            class="chip"
+            :class="{ 'is-active': onlinePicked.includes(src.id) }"
+            :title="src.source_url"
+            @click="toggleOnlinePicked(src.id)"
+          >
+            {{ src.name }}
+          </button>
+        </div>
+        <span v-if="onlineSourceNames" class="muted-xs online-scope-hint">
+          {{ onlineSourceNames }}
+        </span>
+      </div>
+
+      <el-alert
+        v-if="onlineError"
+        type="info"
+        :closable="false"
+        show-icon
+        :title="onlineError"
+        class="online-alert"
+      />
+
+      <div v-if="onlineStatus.length" class="online-status">
+        <span v-for="s in onlineStatus" :key="s.id" class="status-chip" :class="{ 'is-bad': !!s.error }">
+          {{ s.name }}<template v-if="s.error"> · 失败</template><template v-else> · {{ s.count }}</template>
+        </span>
+      </div>
+
+      <div v-loading="onlineLoading" class="online-results">
+        <p v-if="!onlineLoading && !onlineItems.length && !onlineError" class="muted online-empty">
+          输入关键词后回车，或用右侧「搜索」按钮。搜到喜欢的书可以「加入书库」，方便统一管理。
+        </p>
+
+        <article v-for="item in onlineItems" :key="item.key" class="online-card">
+          <div class="oc-cover">
+            <img v-if="item.cover_url" :src="item.cover_url" :alt="item.name" loading="lazy" />
+            <span v-else class="oc-cover-ph">{{ item.name.slice(0, 1) }}</span>
+          </div>
+          <div class="oc-body">
+            <h3 class="oc-title">{{ item.name }}</h3>
+            <p class="oc-meta">
+              {{ item.author || "佚名" }}
+              <span v-if="item.word_count"> · {{ (item.word_count / 10000).toFixed(1) }} 万字</span>
+            </p>
+            <p v-if="item.last_chapter" class="oc-last">最新：{{ item.last_chapter }}</p>
+            <p v-if="item.intro" class="oc-intro">{{ item.intro }}</p>
+            <div class="oc-sources">
+              <button
+                v-for="src in item.sources"
+                :key="src.source_id"
+                type="button"
+                class="oc-add"
+                :disabled="!!addingKey"
+                @click="onAddOnline(item, src)"
+              >
+                {{ addingKey === `${item.name}|${src.source_id}` ? "加入中…" : `加入书库 · ${src.source_name}` }}
+              </button>
+            </div>
+          </div>
+        </article>
+      </div>
+    </section>
 
     <!-- 批量编辑弹窗：只提交勾选项 -->
     <el-dialog v-model="batchEditOpen" title="批量编辑" width="460px" append-to-body>
@@ -928,6 +1161,50 @@ function onResize() {
   color: var(--color-text-2);
   font-size: var(--text-xs);
   border: 1px solid var(--color-border);
+}
+
+.mode-toggle {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2);
+}
+
+.mode-btn {
+  border: none;
+  background: none;
+  padding: 5px 12px;
+  border-radius: calc(var(--radius-md) - 2px);
+  color: var(--color-text-2);
+  font-size: var(--text-xs);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.mode-btn.is-active {
+  background: var(--color-surface);
+  color: var(--color-accent);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+.search-go {
+  flex-shrink: 0;
+  border: none;
+  background: var(--color-accent);
+  color: #fff;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.search-go:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .search-box {
@@ -1299,6 +1576,176 @@ function onResize() {
   .batch-actions .ghost-btn,
   .batch-actions .primary-btn {
     flex: 1;
+  }
+}
+
+/* ---------------------------- 在线搜索结果 ---------------------------- */
+.online-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.online-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.online-scope {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.online-scope-hint {
+  opacity: 0.75;
+  word-break: break-all;
+}
+
+.online-alert {
+  margin: 0;
+}
+
+.online-status {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.status-chip {
+  padding: 2px 9px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-2);
+  color: var(--color-text-3);
+  font-size: var(--text-xs);
+}
+
+.status-chip.is-bad {
+  border-color: var(--color-danger, #f56c6c);
+  color: var(--color-danger, #f56c6c);
+}
+
+.online-results {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 120px;
+}
+
+.online-empty {
+  padding: var(--space-5) 0;
+  text-align: center;
+}
+
+.online-card {
+  display: flex;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.oc-cover {
+  flex-shrink: 0;
+  width: 64px;
+  height: 88px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--color-surface-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.oc-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.oc-cover-ph {
+  font-size: 24px;
+  color: var(--color-text-3);
+}
+
+.oc-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.oc-title {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.oc-meta,
+.oc-last {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--color-text-3);
+}
+
+.oc-intro {
+  margin: 2px 0 0;
+  font-size: var(--text-xs);
+  color: var(--color-text-2);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.oc-sources {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.oc-add {
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-2);
+  color: var(--color-text-2);
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.oc-add:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.oc-add:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+@media (max-width: 720px) {
+  .mode-toggle {
+    order: -1;
+  }
+
+  .online-card {
+    padding: 10px;
+  }
+
+  .oc-cover {
+    width: 54px;
+    height: 74px;
   }
 }
 </style>

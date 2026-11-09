@@ -53,6 +53,8 @@ export interface BookListItem {
   book_url?: string;
   source_url?: string;
   dur_chapter_title?: string;
+  /** 在线搜索登记进来的书：服务端无正文，source 为书源名，source_id 为原书地址前缀 */
+  online?: boolean;
 }
 
 /** 书架三部分对照（共有 / 仅服务端 / 仅 Legado） */

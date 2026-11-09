@@ -346,11 +346,22 @@ def admin_list_books(
     books = db.execute(
         stmt.offset(offset).limit(page_size)
     ).scalars().all()
+
+    def _item(b) -> dict:
+        item = book_list_item(b, base)
+        # 在线搜索登记的书没有正文：即使客户端裁剪字段也要保留这两个判定位，
+        # 否则前端会把它当成可读的本地书点进空目录
+        item["readable"] = not item.get("online", False)
+        trimmed = filter_book_fields(item, fields)
+        trimmed["online"] = item["online"]
+        trimmed["readable"] = item["readable"]
+        return trimmed
+
     return {
         "total": total,
         "page": page,
         "page_size": page_size,
-        "items": [filter_book_fields(book_list_item(b, base), fields) for b in books],
+        "items": [_item(b) for b in books],
     }
 
 
