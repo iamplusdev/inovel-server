@@ -72,6 +72,12 @@ def push_book_progress_now(book_id: int, chapter_id: int | None = None) -> dict:
         raise HTTPException(400, str(exc)) from exc
 
 
+@router.post("/sync/pull-all")
+def pull_all_progress(db: Session = Depends(get_db)) -> dict:
+    """书库打开时调用：批量把 WebDAV 上更新的进度写回 DB（最新者胜）。"""
+    return sync_progress.pull_all(db)
+
+
 @router.post("/books/{book_id}/sync/pull")
 def pull_book_progress(book_id: int, db: Session = Depends(get_db)) -> dict:
     """打开阅读页时调用：远端更新则写入本地并返回目标章节。"""

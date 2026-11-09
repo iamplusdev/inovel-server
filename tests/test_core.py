@@ -1612,5 +1612,206 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(data["read_at"], "")
 
 
+    def test_webdav_list_files_decodes_href(self) -> None:
+        """PROPFIND Depth:1 响应里的中文文件名需要 URL 解码后匹配书库。"""
+        from unittest import mock
+
+        from app.webdav import WebDavClient
+
+        xml = (
+            '<?xml version="1.0"?>'
+            '<d:multistatus xmlns:d="DAV:">'
+            "<d:response><d:href>/dav/legado/bookProgress/</d:href></d:response>"
+            "<d:response><d:href>/dav/legado/bookProgress/"
+            "%E6%B5%8B%E8%AF%95%E4%B9%A6_%E4%BD%9C%E8%80%85.json</d:href></d:response>"
+            "<d:response><d:href>/dav/legado/bookProgress/readme.txt</d:href></d:response>"
+            "</d:multistatus>"
+        ).encode("utf-8")
+        client = WebDavClient(base_url="https://dav.example.com/dav")
+        with mock.patch.object(client, "_request", return_value=(207, xml)):
+            names = client.list_files("https://dav.example.com/dav/legado/bookProgress/")
+        self.assertEqual(names, ["测试书_作者.json"])
+
+    def test_sync_pull_all_updates_books_including_never_read(self) -> None:
+        """批量同步：手机 Legado 写过的书（含服务端从未读过的）进度写回 DB。"""
+        import json
+        import time
+        from unittest import mock
+        from urllib.parse import unquote
+
+        from app import sync_progress
+        from app.models import Book, Chapter
+
+        s = self.db.SessionLocal()
+        b1 = Book(title="手机读过", author="作者", category="都市", chapter_count=2)
+        b2 = Book(
+            title="本地较旧", author="作者", category="都市", chapter_count=2,
+            read_chapter_index=0, read_at="2026-01-01T00:00:00", read_percent=50,
+        )
+        s.add_all([b1, b2])
+        s.flush()
+        for b in (b1, b2):
+            s.add_all(
+                [
+                    Chapter(book_id=b.id, index=0, title="第一章", content="a"),
+                    Chapter(book_id=b.id, index=1, title="第二章", content="b"),
+                ]
+            )
+        s.commit()
+        ids = (b1.id, b2.id)
+        s.close()
+
+        remote_ms = int(time.time() * 1000) + 1000
+        remotes = {
+            "手机读过": {
+                "name": "手机读过", "author": "作者", "durChapterIndex": 1,
+                "durChapterPos": 88, "durChapterTime": remote_ms, "durChapterTitle": "第二章",
+            },
+            "本地较旧": {
+                "name": "本地较旧", "author": "作者", "durChapterIndex": 1,
+                "durChapterPos": 10, "durChapterTime": remote_ms, "durChapterTitle": "第二章",
+            },
+        }
+
+        class FakeClient:
+            def list_files(self, url):
+                return [f"{name}_作者.json" for name in remotes]
+
+            def get(self, url):
+                decoded = unquote(url.rsplit("/", 1)[-1])
+                for name, payload in remotes.items():
+                    if decoded.startswith(f"{name}_作者"):
+                        return json.dumps(payload).encode()
+                return None
+
+        settings = {
+            "enabled": True, "url": "https://dav.example.com/dav",
+            "username": "u", "password": "p", "dir": "legado",
+            "timeout": 6, "verify_tls": True,
+        }
+        with mock.patch.object(
+            sync_progress.webdav_settings, "load", return_value=settings
+        ), mock.patch.object(sync_progress, "_client", return_value=FakeClient()):
+            db = self.db.SessionLocal()
+            result = sync_progress.pull_all(db)
+            db.close()
+
+        self.assertTrue(result["enabled"])
+        self.assertTrue(result["listed"])
+        self.assertEqual(result["scanned"], 2)
+        self.assertEqual(result["updated"], 2)
+        db = self.db.SessionLocal()
+        for bid in ids:
+            self.assertEqual(db.get(Book, bid).read_chapter_index, 1)
+        db.close()
+
+    def test_sync_pull_all_endpoint(self) -> None:
+        """POST /api/admin/sync/pull-all 端点：鉴权挂载 + 写回 DB + 响应结构。"""
+        import json
+        import time
+        from unittest import mock
+        from urllib.parse import unquote
+
+        from fastapi.testclient import TestClient
+
+        from app import sync_progress
+        from app.auth import require_admin_dep
+        from app.main import app as fastapi_app
+        from app.models import Book, Chapter
+
+        s = self.db.SessionLocal()
+        book = Book(title="手机端书", author="作者", category="都市", chapter_count=2)
+        s.add(book)
+        s.flush()
+        s.add_all(
+            [
+                Chapter(book_id=book.id, index=0, title="第一章", content="a"),
+                Chapter(book_id=book.id, index=1, title="第二章", content="b"),
+            ]
+        )
+        s.commit()
+        bid = book.id
+        s.close()
+
+        remote = {
+            "name": "手机端书", "author": "作者", "durChapterIndex": 1,
+            "durChapterPos": 30, "durChapterTime": int(time.time() * 1000) + 1000,
+            "durChapterTitle": "第二章",
+        }
+
+        class FakeClient:
+            def list_files(self, url):
+                return ["手机端书_作者.json"]
+
+            def get(self, url):
+                if unquote(url.rsplit("/", 1)[-1]).startswith("手机端书_作者"):
+                    return json.dumps(remote).encode()
+                return None
+
+        settings = {
+            "enabled": True, "url": "https://dav.example.com/dav",
+            "username": "u", "password": "p", "dir": "legado",
+            "timeout": 6, "verify_tls": True,
+        }
+        fastapi_app.dependency_overrides[require_admin_dep] = lambda: "admin"
+        try:
+            with mock.patch.object(
+                sync_progress.webdav_settings, "load", return_value=settings
+            ), mock.patch.object(sync_progress, "_client", return_value=FakeClient()):
+                resp = TestClient(fastapi_app).post("/api/admin/sync/pull-all")
+        finally:
+            fastapi_app.dependency_overrides.pop(require_admin_dep, None)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertTrue(data["enabled"])
+        self.assertEqual(data["updated"], 1)
+        self.assertEqual(data["books"][0]["book_id"], bid)
+        db = self.db.SessionLocal()
+        self.assertEqual(db.get(Book, bid).read_chapter_index, 1)
+        db.close()
+
+    def test_sync_pull_all_falls_back_when_listing_fails(self) -> None:
+        """WebDAV 不支持列目录时，至少扫描已有本地进度的书。"""
+        import time
+        from unittest import mock
+
+        from app import sync_progress
+        from app.models import Book
+
+        s = self.db.SessionLocal()
+        s.add(
+            Book(
+                title="有进度", author="作者", category="都市",
+                read_chapter_index=0, read_at="2026-01-01T00:00:00",
+            )
+        )
+        s.add(Book(title="无进度", author="作者", category="都市"))
+        s.commit()
+        s.close()
+
+        class FakeClient:
+            def list_files(self, url):
+                raise RuntimeError("PROPFIND unsupported")
+
+            def get(self, url):
+                return None
+
+        settings = {
+            "enabled": True, "url": "https://dav.example.com/dav",
+            "username": "u", "password": "p", "dir": "legado",
+            "timeout": 6, "verify_tls": True,
+        }
+        with mock.patch.object(
+            sync_progress.webdav_settings, "load", return_value=settings
+        ), mock.patch.object(sync_progress, "_client", return_value=FakeClient()):
+            db = self.db.SessionLocal()
+            result = sync_progress.pull_all(db)
+            db.close()
+        self.assertFalse(result["listed"])
+        self.assertEqual(result["scanned"], 1)
+        self.assertEqual(result["updated"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

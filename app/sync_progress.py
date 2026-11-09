@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -136,9 +136,18 @@ def _chapters(db: Session, book_id: int) -> list[Chapter]:
     )
 
 
-def pull_progress(db: Session, book_id: int) -> dict:
-    """打开阅读页时拉取远端进度；远端更新则写入本地并返回目标章节。"""
-    settings = webdav_settings.load()
+def pull_progress(
+    db: Session,
+    book_id: int,
+    *,
+    client: WebDavClient | None = None,
+    settings: dict | None = None,
+) -> dict:
+    """打开阅读页时拉取远端进度；远端更新则写入本地并返回目标章节。
+
+    client/settings 可由批量同步传入复用（一次认证、一次配置读取）。
+    """
+    settings = settings or webdav_settings.load()
     if not webdav_settings.is_configured(settings):
         return {"enabled": False, "updated": False}
 
@@ -148,7 +157,7 @@ def pull_progress(db: Session, book_id: int) -> dict:
 
     filename = progress_filename(book.title, book.author)
     try:
-        raw = _client(settings).get(progress_url(settings, filename))
+        raw = (client or _client(settings)).get(progress_url(settings, filename))
     except Exception as exc:  # noqa: BLE001
         # 网络/证书/URL 异常统一降级为「本次不更新」，不阻断阅读
         logger.warning("拉取远程进度失败 book=%s: %s", book_id, exc)
@@ -209,10 +218,16 @@ def pull_progress(db: Session, book_id: int) -> dict:
         remote_ms = int(time.time() * 1000)
 
     total = len(chapters)
-    book.read_chapter_index = int(chapter.index)
-    book.read_percent = int(round((chapter.index + 1) * 100 / total)) if total else 0
-    book.read_at = _ms_to_iso(remote_ms)
-    db.commit()
+
+    def _apply() -> None:
+        # apply() 可能在 FTS 自愈回滚后被重放，字段赋值必须放在闭包内
+        book.read_chapter_index = int(chapter.index)
+        book.read_percent = int(round((chapter.index + 1) * 100 / total)) if total else 0
+        book.read_at = _ms_to_iso(remote_ms)
+
+    from .database import commit_with_fts_recovery
+
+    commit_with_fts_recovery(db, _apply)
 
     return {
         **base,
@@ -221,6 +236,72 @@ def pull_progress(db: Session, book_id: int) -> dict:
         "chapter_index": chapter.index,
         "chapter_title": chapter.title,
         "chapter_pos": remote["durChapterPos"],
+    }
+
+
+def pull_all(db: Session, limit: int = 300) -> dict:
+    """书库打开时批量拉取 WebDAV 进度（客户端按需调用，不做服务端定时同步）。
+
+    一次 PROPFIND 列出 Legado 写过的 bookProgress 文件 → 按 {书名}_{作者}.json
+    匹配书库 → 逐本复用 pull_progress 的「最新者胜」比对。这样：
+    - 手机 Legado 读过的书，即使本机/服务端此前从未读过，也会出现在继续阅读里；
+    - 未产生过进度文件的书不会发出任何 GET 请求。
+
+    WebDAV 不支持列目录时降级为「只扫描已有本地进度的书」，保证基本可用。
+    """
+    settings = webdav_settings.load()
+    if not webdav_settings.is_configured(settings):
+        return {"enabled": False, "listed": False, "scanned": 0, "updated": 0, "books": []}
+
+    books = db.execute(select(Book)).scalars().all()
+    by_filename: dict[str, Book] = {}
+    for book in books:
+        # progress_filename 做过 URL 编码；目录响应已解码，统一到解码后的名字比较
+        by_filename[unquote(progress_filename(book.title, book.author))] = book
+
+    client = _client(settings)
+    listed = True
+    try:
+        names = client.list_files(progress_dir_url(settings))
+        candidates = [by_filename[n] for n in names if n in by_filename]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("列出远程进度目录失败，降级扫描已有进度书籍: %s", exc)
+        listed = False
+        # 注意 read_chapter_index=0 是合法的「读过第一章」，不能用 `or -1` 兜底
+        candidates = [
+            b for b in books
+            if int(b.read_chapter_index if b.read_chapter_index is not None else -1) >= 0
+        ]
+
+    scanned = 0
+    updated: list[dict] = []
+    errors = 0
+    for book in candidates[: max(1, min(limit, 1000))]:
+        scanned += 1
+        try:
+            result = pull_progress(db, int(book.id), client=client, settings=settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("批量同步失败 book=%s: %s", book.id, exc)
+            errors += 1
+            continue
+        if result.get("error"):
+            errors += 1
+        if result.get("updated"):
+            updated.append(
+                {
+                    "book_id": int(book.id),
+                    "chapter_id": result.get("chapter_id"),
+                    "chapter_index": result.get("chapter_index"),
+                    "remote_time": result.get("remote_time"),
+                }
+            )
+    return {
+        "enabled": True,
+        "listed": listed,
+        "scanned": scanned,
+        "updated": len(updated),
+        "errors": errors,
+        "books": updated,
     }
 
 

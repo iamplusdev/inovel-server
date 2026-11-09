@@ -115,6 +115,45 @@ class WebDavClient:
             raise WebDavError("WebDAV 认证失败，请检查账号/密码")
         raise WebDavError(f"创建目录失败（HTTP {status}）")
 
+    def list_files(self, url: str) -> list[str]:
+        """列出目录下直接子文件（Depth: 1），返回解码后的文件名。
+
+        用于批量进度同步：一次 PROPFIND 拿到 Legado 写过的所有 bookProgress 文件，
+        避免为书库里每本书都发一次 GET。只取 .json、跳过目录项本身。
+        """
+        body = (
+            b'<?xml version="1.0" encoding="utf-8"?>'
+            b'<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+        )
+        status, payload = self._request(
+            "PROPFIND",
+            url,
+            data=body,
+            headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+        )
+        if status in (401, 403):
+            raise WebDavError("WebDAV 认证失败，请检查账号/密码")
+        if status == 404:
+            return []
+        if status not in (200, 207):
+            raise WebDavError(f"列出目录失败（HTTP {status}）")
+        try:
+            import xml.etree.ElementTree as ET
+
+            root = ET.fromstring(payload)
+        except Exception as exc:  # noqa: BLE001
+            raise WebDavError(f"WebDAV 目录响应无法解析：{exc}") from exc
+
+        names: list[str] = []
+        for node in root.iter("{DAV:}href"):
+            raw = (node.text or "").strip()
+            if not raw:
+                continue
+            name = urllib.parse.unquote(urllib.parse.urlparse(raw).path.rstrip("/").split("/")[-1])
+            if name.lower().endswith(".json"):
+                names.append(name)
+        return names
+
     def propfind(self, url: str) -> bool:
         body = (
             b'<?xml version="1.0" encoding="utf-8"?>'
