@@ -35,6 +35,7 @@ const navItems = [
   { path: "/check", label: "体检", name: "check", icon: "check" },
   { path: "/stats", label: "统计", name: "stats", icon: "stats" },
   { path: "/api-docs", label: "API", name: "api-docs", icon: "api" },
+  { path: "/book-sources", label: "书源", name: "book-sources", icon: "list" },
   { path: "/settings", label: "设置", name: "settings", icon: "settings" },
 ];
 

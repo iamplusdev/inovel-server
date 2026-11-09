@@ -393,3 +393,168 @@ export function rebuildThumbs(payload: {
 } = {}) {
   return http.post<ThumbRebuildResult>("/api/admin/books/thumbs/rebuild", payload);
 }
+
+// —— Legado 书源管理 ——
+
+export interface BookSourceItem {
+  id: number;
+  source_url: string;
+  name: string;
+  group_name: string;
+  source_type: number;
+  enabled: boolean;
+  enabled_explore: boolean;
+  weight: number;
+  remark: string;
+  last_checked_at: string;
+  last_check_ok: boolean;
+  created_at: string;
+  updated_at: string;
+  /** 仅详情返回：完整 Legado 书源对象 */
+  raw?: Record<string, unknown>;
+}
+
+export interface BookSourceList {
+  items: BookSourceItem[];
+  total: number;
+  page: number;
+  page_size: number;
+  groups: string[];
+}
+
+export interface BookSourceSettings {
+  subscribe_token: string;
+  public_base_url: string;
+  subscribe_path: string;
+  subscribe_url: string;
+  token_created_at: string;
+}
+
+export interface BookSourceImportResult {
+  total: number;
+  created: number;
+  updated: number;
+  skipped: number;
+  errors: string[];
+}
+
+export interface BookSourceCheck {
+  label: string;
+  ok: boolean;
+  level: "ok" | "error" | "warning";
+  detail: string;
+}
+
+export interface BookSourceProbe {
+  ok: boolean;
+  status: number;
+  ms: number;
+  final_url: string;
+  error: string;
+  skipped: string;
+}
+
+export interface BookSourceValidation {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  checks: BookSourceCheck[];
+  probe?: BookSourceProbe | null;
+  id?: number;
+  name?: string;
+}
+
+export interface BookSourceQuery {
+  [key: string]: string | number | boolean | undefined;
+  q?: string;
+  group?: string;
+  enabled?: boolean;
+  page?: number;
+  page_size?: number;
+}
+
+export function fetchBookSources(query: BookSourceQuery = {}) {
+  return http.get<BookSourceList>("/api/admin/book-sources", query);
+}
+
+export function fetchBookSource(id: number) {
+  return http.get<BookSourceItem>(`/api/admin/book-sources/${id}`);
+}
+
+export function createBookSource(payload: {
+  source?: Record<string, unknown>;
+  sources?: Record<string, unknown>[];
+  overwrite?: boolean;
+  remark?: string;
+}) {
+  return http.post<BookSourceImportResult>("/api/admin/book-sources", payload);
+}
+
+export function updateBookSource(
+  id: number,
+  payload: { source: Record<string, unknown>; remark?: string },
+) {
+  return http.put<BookSourceItem>(`/api/admin/book-sources/${id}`, payload);
+}
+
+export function patchBookSource(
+  id: number,
+  payload: Partial<Pick<BookSourceItem, "enabled" | "enabled_explore" | "group_name" | "weight" | "remark">>,
+) {
+  return http.patch<BookSourceItem>(`/api/admin/book-sources/${id}`, payload);
+}
+
+export function deleteBookSource(id: number) {
+  return http.delete<{ deleted: number }>(`/api/admin/book-sources/${id}`);
+}
+
+export function importBookSources(payload: {
+  text?: string;
+  url?: string;
+  sources?: Record<string, unknown>[];
+  overwrite?: boolean;
+}) {
+  return http.post<BookSourceImportResult>("/api/admin/book-sources/import", payload);
+}
+
+export function batchBookSources(payload: {
+  ids: number[];
+  action: "enable" | "disable" | "delete" | "group";
+  group?: string;
+}) {
+  return http.post<{ affected: number }>("/api/admin/book-sources/batch", payload);
+}
+
+export function validateBookSource(payload: {
+  source?: Record<string, unknown>;
+  ids?: number[];
+  probe?: boolean;
+  exclude_id?: number;
+}) {
+  return http.post<BookSourceValidation | { items: BookSourceValidation[] }>(
+    "/api/admin/book-sources/validate",
+    payload,
+  );
+}
+
+export function validateStoredBookSource(id: number, probe: boolean) {
+  return http.post<BookSourceValidation>(`/api/admin/book-sources/${id}/validate`, { probe });
+}
+
+export function fetchBookSourceSettings() {
+  return http.get<BookSourceSettings>("/api/admin/book-sources/settings");
+}
+
+export function resetBookSourceToken() {
+  return http.post<BookSourceSettings>("/api/admin/book-sources/settings/reset-token");
+}
+
+/** 导出下载链接（浏览器带会话 Cookie，直接 window.open / fetch 即可） */
+export function exportBookSourcesUrl(params: { ids?: number[]; group?: string; enabled_only?: boolean } = {}) {
+  const sp = new URLSearchParams();
+  if (params.ids?.length) sp.set("ids", params.ids.join(","));
+  if (params.group) sp.set("group", params.group);
+  if (params.enabled_only) sp.set("enabled_only", "true");
+  const qs = sp.toString();
+  return `/api/admin/book-sources/export${qs ? `?${qs}` : ""}`;
+}

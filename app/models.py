@@ -1,10 +1,10 @@
-"""SQLite 数据模型：Book + Chapter + ImportLog，字段极少、够用即可。"""
+"""SQLite 数据模型：Book + Chapter + ImportLog + BookSource。"""
 from __future__ import annotations
 
 import json
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -117,6 +117,41 @@ class ImportLog(Base):
     def detail_dict(self) -> dict:
         try:
             data = json.loads(self.detail or "{}")
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+
+class BookSource(Base):
+    """Legado 书源：完整 JSON 原样保存（raw_json），常用字段冗余便于列表/筛选。
+
+    规则由手机 Legado 解释执行，服务端只负责存储、导入导出与静态校验，
+    因此不把书源拆成规则表 —— 未知字段必须原样保留，否则导入手机会丢配置。
+    """
+
+    __tablename__ = "book_sources"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Legado 的 bookSourceUrl 是书源唯一标识，同名会覆盖，因此做唯一约束
+    source_url: Mapped[str] = mapped_column(String(500), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    group_name: Mapped[str] = mapped_column(String(100), default="", nullable=False, index=True)
+    # 0 文本 / 1 音频 / 2 图片 / 3 文件（Legado bookSourceType）
+    source_type: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    enabled_explore: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    weight: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    remark: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    last_checked_at: Mapped[str] = mapped_column(String(30), default="", nullable=False)
+    last_check_ok: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[str] = mapped_column(String(30), default=lambda: datetime.now().isoformat(timespec="seconds"))
+    updated_at: Mapped[str] = mapped_column(String(30), default=lambda: datetime.now().isoformat(timespec="seconds"))
+
+    @property
+    def raw_dict(self) -> dict:
+        try:
+            data = json.loads(self.raw_json or "{}")
             return data if isinstance(data, dict) else {}
         except json.JSONDecodeError:
             return {}

@@ -45,6 +45,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: "API / 书源" },
       },
       {
+        path: "book-sources",
+        name: "book-sources",
+        component: () => import("@/views/BookSourcesView.vue"),
+        meta: { title: "书源管理" },
+      },
+      {
         path: "settings",
         name: "settings",
         component: () => import("@/views/SettingsView.vue"),

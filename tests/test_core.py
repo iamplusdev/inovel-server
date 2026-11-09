@@ -1899,6 +1899,172 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["scanned"], 1)
         self.assertEqual(result["updated"], 0)
 
+    def test_book_source_utils_parse_validate_probe(self) -> None:
+        """书源解析（含多对象拼接）、结构校验与内网探测防护。"""
+        import json
+
+        from app import book_source_utils as u
+
+        text = (
+            '{"bookSourceName":"A","bookSourceUrl":"https://a.example.com"}\n'
+            '{"bookSourceName":"B","bookSourceUrl":"https://b.example.com"}'
+        )
+        items = u.parse_sources(text)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(len(u.parse_sources({"sources": items})), 2)
+        self.assertEqual(len(u.parse_sources(json.dumps(items))), 2)
+
+        src = u.normalize_source(
+            {
+                "bookSourceName": "A",
+                "bookSourceUrl": "https://a.example.com",
+                "header": {"User-Agent": "test"},
+                "enabled": "false",
+            }
+        )
+        self.assertEqual(json.loads(src["header"]), {"User-Agent": "test"})
+        self.assertFalse(src["enabled"])  # 字符串布尔值要归一化
+
+        full = {
+            "bookSourceName": "完整源",
+            "bookSourceUrl": "https://a.example.com",
+            "searchUrl": "https://a.example.com/s?q={{key}}",
+            "header": '{"User-Agent":"test"}',
+            "ruleSearch": {"bookList": "$.list", "name": "$.name", "bookUrl": "$.url"},
+            "ruleBookInfo": {"name": "$.name", "tocUrl": "$.toc"},
+            "ruleToc": {"chapterList": "$.chapters", "chapterName": "$.title", "chapterUrl": "$.url"},
+            "ruleContent": {"content": "$.content"},
+        }
+        ok = u.validate_source(full, probe=False)
+        self.assertTrue(ok["ok"], ok["errors"])
+        self.assertEqual(ok["warnings"], [])
+        bad = u.validate_source(
+            {"bookSourceName": "", "bookSourceUrl": "ftp://x", "ruleSearch": "oops", "header": "{bad-json"},
+            probe=False,
+        )
+        self.assertFalse(bad["ok"])
+        self.assertGreaterEqual(len(bad["errors"]), 4)
+        # 内网地址不发起真实请求（SSRF 防护）
+        probe = u.probe_url("http://127.0.0.1:9/", timeout=1)
+        self.assertTrue(probe["skipped"])
+
+    def test_book_source_crud_import_export_subscribe(self) -> None:
+        """书源管理端点：CRUD / 批量 / 导入导出 / 校验 / 手机订阅鉴权。"""
+        import json
+
+        from fastapi.testclient import TestClient
+
+        from app.auth import require_admin_dep
+        from app.main import app as fastapi_app
+
+        def make_source(name: str, url: str) -> dict:
+            return {
+                "bookSourceName": name,
+                "bookSourceUrl": url,
+                "bookSourceGroup": "测试分组",
+                "bookSourceType": 0,
+                "enabled": True,
+                "searchUrl": url + "/search?q={{key}}",
+                "header": '{"User-Agent":"test"}',
+                "ruleSearch": {"bookList": "$.list[*]", "name": "$.name", "bookUrl": "$.url"},
+                "ruleBookInfo": {"name": "$.name", "tocUrl": "$.toc"},
+                "ruleToc": {"chapterList": "$.chapters[*]", "chapterName": "$.title", "chapterUrl": "$.url"},
+                "ruleContent": {"content": "$.content"},
+                "customField": "原样保留",  # 未知字段不能丢
+            }
+
+        fastapi_app.dependency_overrides[require_admin_dep] = lambda: "admin"
+        try:
+            c = TestClient(fastapi_app)
+            created = c.post("/api/admin/book-sources", json=make_source("源A", "https://a.example.com"))
+            self.assertEqual(created.status_code, 200, created.text)
+            self.assertEqual(created.json()["created"], 1)
+            duplicate = c.post("/api/admin/book-sources", json=make_source("源A", "https://a.example.com"))
+            self.assertEqual(duplicate.json()["skipped"], 1)
+
+            listed = c.get("/api/admin/book-sources").json()
+            self.assertEqual(listed["total"], 1)
+            self.assertEqual(listed["groups"], ["测试分组"])
+            sid = listed["items"][0]["id"]
+            detail = c.get(f"/api/admin/book-sources/{sid}").json()
+            self.assertEqual(detail["raw"]["customField"], "原样保留")
+
+            checked = c.post(
+                "/api/admin/book-sources/validate",
+                json={"source": detail["raw"], "probe": False, "exclude_id": sid},
+            ).json()
+            self.assertTrue(checked["ok"], checked["errors"])
+            bad = c.post(
+                "/api/admin/book-sources/validate",
+                json={"source": {**detail["raw"], "header": "{not-json"}, "probe": False, "exclude_id": sid},
+            ).json()
+            self.assertFalse(bad["ok"])
+
+            patched = c.patch(
+                f"/api/admin/book-sources/{sid}", json={"enabled": False, "group_name": "新分组"}
+            ).json()
+            self.assertFalse(patched["enabled"])
+            self.assertEqual(patched["group_name"], "新分组")
+            raw_after = c.get(f"/api/admin/book-sources/{sid}").json()["raw"]
+            self.assertFalse(raw_after["enabled"])  # PATCH 必须同步写回 raw_json
+            self.assertEqual(raw_after["bookSourceGroup"], "新分组")
+
+            cfg_data = c.get("/api/admin/book-sources/settings").json()
+            token = cfg_data["subscribe_token"]
+            self.assertTrue(token)
+            self.assertIn(f"token={token}", cfg_data["subscribe_url"])
+            # 全被禁用时订阅为空数组
+            self.assertEqual(c.get("/api/legado/sources", params={"token": token}).json(), [])
+            self.assertEqual(c.get("/api/legado/sources").status_code, 401)
+
+            c.patch(f"/api/admin/book-sources/{sid}", json={"enabled": True})
+            imported = c.post(
+                "/api/admin/book-sources/import",
+                json={
+                    "text": json.dumps(
+                        [
+                            make_source("源B", "https://b.example.com"),
+                            {**make_source("源A-改", "https://a.example.com")},
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "overwrite": True,
+                },
+            )
+            self.assertEqual(imported.status_code, 200, imported.text)
+            self.assertEqual(imported.json()["created"], 1)
+            self.assertEqual(imported.json()["updated"], 1)
+
+            exported = c.get("/api/admin/book-sources/export").json()
+            self.assertIsInstance(exported, list)
+            self.assertEqual(len(exported), 2)
+            self.assertTrue(any(x.get("customField") == "原样保留" for x in exported))
+
+            subscribed = c.get("/api/legado/sources", params={"token": token}).json()
+            self.assertIsInstance(subscribed, list)
+            self.assertEqual(len(subscribed), 2)
+            self.assertTrue(all("bookSourceUrl" in x for x in subscribed))
+            # 订阅可按分组过滤
+            by_group = c.get(
+                "/api/legado/sources", params={"token": token, "group": "测试分组"}
+            ).json()
+            self.assertEqual(len(by_group), 2)
+
+            new_token = c.post("/api/admin/book-sources/settings/reset-token").json()["subscribe_token"]
+            self.assertNotEqual(new_token, token)
+            self.assertEqual(c.get("/api/legado/sources", params={"token": token}).status_code, 401)
+            self.assertEqual(c.get("/api/legado/sources", params={"token": new_token}).status_code, 200)
+
+            batched = c.post(
+                "/api/admin/book-sources/batch", json={"ids": [sid], "action": "disable"}
+            ).json()
+            self.assertEqual(batched["affected"], 1)
+            self.assertEqual(len(c.get("/api/legado/sources", params={"token": new_token}).json()), 1)
+            self.assertEqual(c.delete(f"/api/admin/book-sources/{sid}").status_code, 200)
+            self.assertEqual(c.get("/api/admin/book-sources").json()["total"], 1)
+        finally:
+            fastapi_app.dependency_overrides.pop(require_admin_dep, None)
+
 
 if __name__ == "__main__":
     unittest.main()
