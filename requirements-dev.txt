@@ -1,2 +1,8 @@
 # 开发/测试依赖（生产镜像不装）
 pytest>=8.0,<9.0
+
+# starlette>=1.0 的 TestClient 优先 import httpx2，缺失时回退 import httpx；
+# 干净 CI 环境两者都不会被自动安装，缺了会直接抛
+# "The starlette.testclient module requires the httpx2 package to be installed"。
+# 本地已验证 httpx 0.28.x + starlette 1.10.x 组合可用（仅一条 deprecation warning）。
+httpx>=0.27,<1.0
