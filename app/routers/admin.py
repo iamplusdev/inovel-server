@@ -295,9 +295,39 @@ def admin_list_books(
     page_size: int = Query(default=20, ge=1, le=200),
     # 可选字段裁剪：fields=id,name,author,cover_thumb_url
     fields: str | None = Query(default=None, max_length=500),
+    # 书架来源：server=仅本地书库（默认，行为不变）；all/both/legado 走合并书架
+    origin: str = Query(default="server"),
     db: Session = Depends(get_db),
 ) -> dict:
     base = resolve_base_url(request)
+    # 直接调用函数（单测）时 Query(...) 传进来的是 FieldInfo 对象而非默认值
+    if not isinstance(origin, str):
+        origin = str(getattr(origin, "default", "server") or "server")
+    if not isinstance(sort, str):
+        sort = str(getattr(sort, "default", "updated") or "updated")
+    if isinstance(read, bool) is False:
+        read = bool(getattr(read, "default", False))
+    if origin in ("all", "both", "legado"):
+        from .. import backup_restore as br
+
+        return br.merged_books(
+            db,
+            q=q or "",
+            origin=origin,
+            sort=sort,
+            page=page,
+            page_size=page_size,
+            fields=fields,
+            base=base,
+            read=read,
+            category=category,
+            source=source,
+            status=status,
+            tag=tag,
+            scraped=scraped,
+        )
+    if origin != "server":
+        raise HTTPException(400, "origin 需为 server/all/both/legado")
     offset = (page - 1) * page_size
     # 与公开 API 共用查询构造；管理端搜索不含简介
     stmt = build_books_stmt(

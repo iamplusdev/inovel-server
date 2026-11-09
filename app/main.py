@@ -18,7 +18,7 @@ from .auth import require_read_dep
 from .config import settings
 from .database import init_db
 from .logging_setup import setup_logging
-from .routers import admin, auth, batch_scrape, book_sources, legado, library, public, scrape, sync
+from .routers import admin, auth, batch_scrape, book_sources, legado, library, public, scrape, shelf, sync
 from .importer import ensure_category_dirs
 
 setup_logging()
@@ -76,6 +76,7 @@ app.include_router(library.router)
 app.include_router(batch_scrape.router)
 app.include_router(sync.router)
 app.include_router(book_sources.router)
+app.include_router(shelf.router)
 # 手机 Legado「网络导入」订阅端点：自带令牌鉴权，不受 legado 读接口依赖影响
 app.include_router(book_sources.subscribe_router)
 

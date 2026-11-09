@@ -122,6 +122,53 @@ class ImportLog(Base):
             return {}
 
 
+class LegadoShelfBook(Base):
+    """从 Legado WebDAV 备份恢复的「书架书籍」。
+
+    与 Book（服务端本地正文书库）分开存放：Legado 书架里的在线书没有正文文件，
+    不能塞进 books 表（会污染章节、FTS、体检与导入统计）。这里保留完整原始
+    JSON（raw_json），并冗余常用字段用于列表/筛选；book_id 表示与本地书库
+    匹配的书（「共有」），为空则是「仅 Legado 有」。
+    """
+
+    __tablename__ = "legado_shelf_books"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 唯一键：Legado 的 origin(bookSourceUrl) + bookUrl，缺失时退化到 书名_作者
+    shelf_key: Mapped[str] = mapped_column(String(500), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    author: Mapped[str] = mapped_column(String(100), default="", nullable=False, index=True)
+    book_url: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
+    toc_url: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
+    origin: Mapped[str] = mapped_column(String(500), default="", nullable=False, index=True)
+    origin_name: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    cover_url: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
+    intro: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    kind: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    latest_chapter: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    group_name: Mapped[str] = mapped_column(String(100), default="", nullable=False)
+    word_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # 阅读进度（Legado 备份中带的信息，仅展示用，不覆盖本地进度）
+    dur_chapter_index: Mapped[int] = mapped_column(Integer, default=-1, nullable=False)
+    dur_chapter_title: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    dur_chapter_pos: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    dur_chapter_time: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # 与本地书库匹配上的 Book.id；空 = 仅 Legado 有（在线书）
+    book_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    backup_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    created_at: Mapped[str] = mapped_column(String(30), default=lambda: datetime.now().isoformat(timespec="seconds"))
+    updated_at: Mapped[str] = mapped_column(String(30), default=lambda: datetime.now().isoformat(timespec="seconds"))
+
+    @property
+    def raw_dict(self) -> dict:
+        try:
+            data = json.loads(self.raw_json or "{}")
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+
 class BookSource(Base):
     """Legado 书源：完整 JSON 原样保存（raw_json），常用字段冗余便于列表/筛选。
 

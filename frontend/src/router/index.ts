@@ -51,6 +51,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: "书源管理" },
       },
       {
+        path: "shelf-restore",
+        name: "shelf-restore",
+        component: () => import("@/views/ShelfRestoreView.vue"),
+        meta: { title: "书架对照 / 备份恢复" },
+      },
+      {
         path: "settings",
         name: "settings",
         component: () => import("@/views/SettingsView.vue"),

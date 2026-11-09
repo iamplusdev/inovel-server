@@ -42,6 +42,97 @@ export interface BookListItem {
   read_percent?: number;
   /** 最近阅读时间（ISO8601，空串=未读） */
   read_at?: string;
+  /** 书架来源：both=两个书架共有 / server=仅服务端 / legado=仅 Legado */
+  origin?: "both" | "server" | "legado";
+  /** 服务端是否有正文可阅读（仅 Legado 的在线书为 false，id 为负数） */
+  readable?: boolean;
+  /** 在线书在 Legado 书架表里的 id */
+  shelf_id?: number | null;
+  /** 在线书所属 Legado 书源名 / 地址 */
+  source_name?: string;
+  book_url?: string;
+  source_url?: string;
+  dur_chapter_title?: string;
+}
+
+/** 书架三部分对照（共有 / 仅服务端 / 仅 Legado） */
+export interface ShelfCompare {
+  counts: {
+    both: number;
+    server: number;
+    legado: number;
+    server_total: number;
+    shelf_total: number;
+  };
+  both: Array<{
+    id: number;
+    name: string;
+    author: string;
+    read_at?: string;
+    shelf?: ShelfBrief[];
+    shelf_name?: string;
+    shelf_author?: string;
+  }>;
+  server: Array<{ id: number; name: string; author: string; read_at?: string }>;
+  legado: ShelfBrief[];
+  truncated: boolean;
+  limit: number;
+}
+
+export interface ShelfBrief {
+  shelf_id?: number;
+  name: string;
+  author: string;
+  origin_name?: string;
+  origin?: string;
+  book_url?: string;
+  cover_url?: string;
+  latest_chapter?: string;
+  dur_chapter_title?: string;
+  dur_chapter_index?: number;
+  dur_chapter_time?: number;
+  read_at?: string;
+  kind?: string;
+  intro?: string;
+  group_name?: string;
+}
+
+export interface ShelfBackupFile {
+  name: string;
+  path: string;
+  kind: "zip" | "json";
+  size: number;
+  modified: string;
+  is_dir: boolean;
+}
+
+export interface ShelfPreview {
+  ok: boolean;
+  backup_name: string;
+  files: Array<{ name: string; size: number }>;
+  warnings: string[];
+  parsed: {
+    sources: number;
+    books: number;
+    source_sample: Array<{ name: string; url: string }>;
+  };
+  compare: ShelfCompare;
+}
+
+export interface ShelfRestoreResult {
+  backup_name: string;
+  files: Array<{ name: string; size: number }>;
+  warnings: string[];
+  parsed: { sources: number; books: number };
+  sources: { total: number; created: number; updated: number; skipped: number };
+  shelf: { total: number; created: number; updated: number; replace: boolean };
+  compare: ShelfCompare;
+  state: Record<string, unknown>;
+}
+
+export interface ShelfStatus {
+  restored: boolean;
+  state: Record<string, unknown>;
 }
 
 export interface BookListResponse {

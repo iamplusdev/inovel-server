@@ -70,6 +70,13 @@ function isScraped(b: BookListItem) {
   return Boolean(b.source_id);
 }
 
+/** 书架来源角标：仅 Legado 在线书没有服务端正文 */
+const originBadge = computed(() => {
+  if (props.book.origin === "legado") return { text: "手机在线", tone: "online" };
+  if (props.book.origin === "both") return { text: "双端共有", tone: "both" };
+  return null;
+});
+
 /** 阅读进度百分比（0–100），缺省视为 0 */
 function readPercent(b: BookListItem) {
   const n = Number(b.read_percent ?? 0);
@@ -151,6 +158,10 @@ function statusClass(status: string) {
         >
           {{ isScraped(book) ? "已刮削" : "未刮削" }}
         </span>
+      </div>
+
+      <div v-if="originBadge" class="origin-float" :class="`is-${originBadge.tone}`">
+        {{ originBadge.text }}
       </div>
     </div>
 
@@ -355,6 +366,27 @@ function statusClass(status: string) {
 
 .status-float .status-dot {
   color: #e8edf5;
+}
+
+.origin-float {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2px 7px;
+  border-radius: var(--radius-full);
+  font-size: 11px;
+  line-height: 1.5;
+  color: #fff;
+  background: rgba(76, 111, 255, 0.88);
+  backdrop-filter: blur(6px);
+}
+
+.origin-float.is-online {
+  background: rgba(217, 130, 45, 0.9);
+}
+
+.origin-float.is-both {
+  background: rgba(45, 158, 111, 0.88);
 }
 
 .meta {

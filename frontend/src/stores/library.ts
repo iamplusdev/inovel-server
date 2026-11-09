@@ -1,6 +1,6 @@
 import { defineStore } from "pinia";
 import { fetchBooks, fetchStats } from "@/api/admin";
-import type { AdminStats, BookListItem } from "@/api/types";
+import type { AdminStats, BookListItem, BookListResponse } from "@/api/types";
 
 /** 书源行选项（与旧版 SOURCE_OPTS 一致） */
 export const SOURCE_OPTS = ["", "起点", "番茄", "纵横"] as const;
@@ -17,9 +17,13 @@ interface LibraryState {
   category: string;
   /** true=仅未刮削 */
   onlyUnscraped: boolean;
+  /** 书架来源筛选：all=全部 / server=仅本地 / both=共有 / legado=仅在线 */
+  origin: string;
   loading: boolean;
   /** 最近一次列表加载失败信息 */
   error: string;
+  /** 合并书架的来源计数（all/both/server/legado） */
+  originCounts: Record<string, number> | null;
   /** 请求序号：丢弃过期响应 */
   reqSeq: number;
 }
@@ -36,8 +40,10 @@ export const useLibraryStore = defineStore("library", {
     source: "",
     category: "",
     onlyUnscraped: false,
+    origin: "all",
     loading: false,
     error: "",
+    originCounts: null,
     reqSeq: 0,
   }),
   getters: {
@@ -71,12 +77,15 @@ export const useLibraryStore = defineStore("library", {
           source: this.source || undefined,
           category: this.category || undefined,
           scraped: this.onlyUnscraped ? "unscraped" : undefined,
+          origin: this.origin || "all",
         });
         if (seq !== this.reqSeq) return;
         this.page = page;
         this.pageSize = pageSize;
         this.items = data.items || [];
         this.total = data.total || 0;
+        const counts = (data as BookListResponse & { counts?: Record<string, number> }).counts;
+        this.originCounts = counts || null;
         const pages = Math.max(1, Math.ceil(this.total / this.pageSize));
         if (this.page > pages) this.page = pages;
       } catch (e) {
@@ -91,7 +100,7 @@ export const useLibraryStore = defineStore("library", {
     /** 切换筛选后回到第一页并拉取 */
     async applyFilter(
       patch: Partial<
-        Pick<LibraryState, "q" | "source" | "category" | "sort" | "onlyUnscraped">
+        Pick<LibraryState, "q" | "source" | "category" | "sort" | "onlyUnscraped" | "origin">
       >,
     ) {
       if (patch.source !== undefined && patch.source !== this.source) {
@@ -102,6 +111,7 @@ export const useLibraryStore = defineStore("library", {
       }
       if (patch.q !== undefined) this.q = patch.q;
       if (patch.onlyUnscraped !== undefined) this.onlyUnscraped = patch.onlyUnscraped;
+      if (patch.origin !== undefined) this.origin = patch.origin;
       if (patch.sort !== undefined) {
         this.sort = patch.sort;
         localStorage.setItem("novel_sort", patch.sort);

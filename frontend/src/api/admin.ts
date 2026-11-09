@@ -24,6 +24,8 @@ export interface BookQuery {
   scraped?: string;
   /** true=仅读过的书（配合 sort=read 做继续阅读） */
   read?: boolean;
+  /** 书架来源：server=仅本地（默认）/ all=合并 / both=共有 / legado=仅在线 */
+  origin?: string;
   /** 可选字段裁剪，如 id,name,author,cover_thumb_url */
   fields?: string;
 }

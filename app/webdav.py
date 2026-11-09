@@ -59,6 +59,7 @@ class WebDavClient:
         url: str,
         data: bytes | None = None,
         headers: dict[str, str] | None = None,
+        max_bytes: int | None = None,
     ) -> tuple[int, bytes]:
         hdrs = {"User-Agent": "novel-server/1.0"}
         if self._auth:
@@ -68,6 +69,11 @@ class WebDavClient:
         req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
+                if max_bytes is not None:
+                    body = resp.read(max_bytes + 1)
+                    if len(body) > max_bytes:
+                        raise WebDavError(f"文件超过 {max_bytes // 1024 // 1024} MB 上限")
+                    return resp.status, body
                 return resp.status, resp.read()
         except urllib.error.HTTPError as e:
             try:
@@ -86,8 +92,8 @@ class WebDavClient:
         except TimeoutError as e:
             raise WebDavError("连接超时") from e
 
-    def get(self, url: str) -> bytes | None:
-        status, body = self._request("GET", url)
+    def get(self, url: str, max_bytes: int | None = None) -> bytes | None:
+        status, body = self._request("GET", url, max_bytes=max_bytes)
         if status == 200:
             return body
         if status == 404:
@@ -153,6 +159,69 @@ class WebDavClient:
             if name.lower().endswith(".json"):
                 names.append(name)
         return names
+
+    def list_entries(self, url: str) -> list[dict]:
+        """列出目录下直接子项（Depth: 1），返回 name/size/modified/is_dir。
+
+        用于「从 WebDAV 备份恢复」：Legado 的备份是 backup*.zip / bookshelf.json /
+        bookSource.json，需要拿到文件名、大小与修改时间供用户选择。
+        """
+        body = (
+            b'<?xml version="1.0" encoding="utf-8"?>'
+            b'<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/>'
+            b'<d:getcontentlength/><d:getlastmodified/></d:prop></d:propfind>'
+        )
+        status, payload = self._request(
+            "PROPFIND",
+            url,
+            data=body,
+            headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+        )
+        if status in (401, 403):
+            raise WebDavError("WebDAV 认证失败，请检查账号/密码")
+        if status == 404:
+            return []
+        if status not in (200, 207):
+            raise WebDavError(f"列出目录失败（HTTP {status}）")
+        try:
+            import xml.etree.ElementTree as ET
+
+            root = ET.fromstring(payload)
+        except Exception as exc:  # noqa: BLE001
+            raise WebDavError(f"WebDAV 目录响应无法解析：{exc}") from exc
+
+        requested = urllib.parse.urlparse(url).path.rstrip("/")
+        entries: list[dict] = []
+        for response in root.iter("{DAV:}response"):
+            href = ""
+            size = 0
+            modified = ""
+            is_dir = False
+            for node in response.iter():
+                tag = node.tag.split("}")[-1]
+                if tag == "href":
+                    href = (node.text or "").strip()
+                elif tag == "getcontentlength":
+                    try:
+                        size = int((node.text or "0").strip())
+                    except ValueError:
+                        size = 0
+                elif tag == "getlastmodified":
+                    modified = (node.text or "").strip()
+                elif tag == "collection":
+                    is_dir = True
+            if not href:
+                continue
+            path = urllib.parse.urlparse(href).path.rstrip("/")
+            if path == requested:
+                continue  # 目录项本身
+            name = urllib.parse.unquote(path.split("/")[-1])
+            if not name:
+                continue
+            entries.append(
+                {"name": name, "size": size, "modified": modified, "is_dir": is_dir}
+            )
+        return entries
 
     def propfind(self, url: str) -> bool:
         body = (

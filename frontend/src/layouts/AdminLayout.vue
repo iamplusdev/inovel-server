@@ -36,6 +36,7 @@ const navItems = [
   { path: "/stats", label: "统计", name: "stats", icon: "stats" },
   { path: "/api-docs", label: "API", name: "api-docs", icon: "api" },
   { path: "/book-sources", label: "书源", name: "book-sources", icon: "list" },
+  { path: "/shelf-restore", label: "书架同步", name: "shelf-restore", icon: "refresh" },
   { path: "/settings", label: "设置", name: "settings", icon: "settings" },
 ];
 

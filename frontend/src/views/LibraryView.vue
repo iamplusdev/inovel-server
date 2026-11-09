@@ -7,6 +7,7 @@ import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { SOURCE_OPTS, useLibraryStore } from "@/stores/library";
 import { batchDeleteBooks, batchUpdateBooks, fetchBooks, pullAllBookProgress } from "@/api/admin";
+import { fetchShelfBook } from "@/api/shelf";
 import type { BatchUpdateBody } from "@/api/admin";
 import { startBatchScrape } from "@/api/progress";
 import type { BookListItem } from "@/api/types";
@@ -75,6 +76,40 @@ const sortOptions = [
   { value: "words", label: "字数" },
   { value: "chapters", label: "章节" },
 ];
+
+/** 书架来源筛选：三部分拆开看 */
+const ORIGIN_OPTS = [
+  { value: "all", label: "全部书架" },
+  { value: "both", label: "双端共有" },
+  { value: "server", label: "仅服务端" },
+  { value: "legado", label: "仅手机在线" },
+];
+
+/** 仅 Legado 的在线书：没有服务端正文，点开只展示信息 */
+const onlineDetail = ref<BookListItem | null>(null);
+const onlineBusy = ref(false);
+/** 三部分计数，随书库列表一起返回 */
+const shelfCounts = computed(() => lib.originCounts);
+
+async function showOnlineBook(book: BookListItem) {
+  onlineDetail.value = book;
+  if (!book.shelf_id) return;
+  onlineBusy.value = true;
+  try {
+    const detail = await fetchShelfBook(book.shelf_id);
+    onlineDetail.value = { ...book, ...(detail as unknown as BookListItem) };
+  } catch {
+    // 列表里已有基本信息，详情失败不阻断展示
+  } finally {
+    onlineBusy.value = false;
+  }
+}
+
+function onOriginClick(value: string) {
+  if (value === lib.origin) return;
+  clearSelection();
+  void lib.applyFilter({ origin: value });
+}
 
 const gridStyle = computed(() => {
   if (viewMode.value === "list") {
@@ -175,6 +210,8 @@ function readQueryToStore(): boolean {
   const rawSort = queryStr(q.sort);
   const nextSort = sortOptions.some((o) => o.value === rawSort) ? rawSort : "updated";
   const nextUnscraped = queryStr(q.unscraped) === "1";
+  const rawOrigin = queryStr(q.origin);
+  const nextOrigin = ORIGIN_OPTS.some((o) => o.value === rawOrigin) ? rawOrigin : "all";
   const rawPage = Number.parseInt(queryStr(q.page), 10);
   const nextPage = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : 1;
 
@@ -184,6 +221,7 @@ function readQueryToStore(): boolean {
     lib.category !== nextCategory ||
     lib.sort !== nextSort ||
     lib.onlyUnscraped !== nextUnscraped ||
+    lib.origin !== nextOrigin ||
     lib.page !== nextPage;
   if (!changed) return false;
 
@@ -192,6 +230,7 @@ function readQueryToStore(): boolean {
   lib.category = nextCategory;
   lib.sort = nextSort;
   lib.onlyUnscraped = nextUnscraped;
+  lib.origin = nextOrigin;
   lib.page = nextPage;
   searchInput.value = nextQ;
   localStorage.setItem("novel_sort", nextSort);
@@ -206,6 +245,7 @@ function desiredQuery(): Record<string, string> {
   if (lib.category) next.category = lib.category;
   if (lib.sort && lib.sort !== "updated") next.sort = lib.sort;
   if (lib.onlyUnscraped) next.unscraped = "1";
+  if (lib.origin && lib.origin !== "all") next.origin = lib.origin;
   if (lib.page > 1) next.page = String(lib.page);
   return next;
 }
@@ -228,7 +268,7 @@ function syncQuery() {
 
 // 筛选变化 → 写回 URL（replace，不污染返回历史）
 watch(
-  () => [lib.q, lib.source, lib.category, lib.sort, lib.onlyUnscraped, lib.page] as const,
+  () => [lib.q, lib.source, lib.category, lib.sort, lib.onlyUnscraped, lib.origin, lib.page] as const,
   syncQuery,
 );
 // URL 变化（刷新/浏览器返回/前进）→ 恢复筛选并重新拉取
@@ -240,6 +280,12 @@ watch(
 );
 
 function openBook(id: number) {
+  // 负数 id = 仅 Legado 的在线书，服务端没有正文，展示信息而不是进编辑页
+  const book = lib.items.find((b) => b.id === id);
+  if (book && book.readable === false) {
+    void showOnlineBook(book);
+    return;
+  }
   router.push({ name: "book-detail", params: { id: String(id) } });
 }
 
@@ -293,6 +339,7 @@ async function syncContinueFromWebDAV(): Promise<void> {
 }
 
 function toggleSelect(id: number) {
+  if (id < 0) return; // 在线书不在本地库，不能批量编辑/删除
   const next = new Set(selectedIds.value);
   if (next.has(id)) next.delete(id);
   else next.add(id);
@@ -301,7 +348,7 @@ function toggleSelect(id: number) {
 
 function selectAllOnPage() {
   const next = new Set(selectedIds.value);
-  for (const b of lib.items) next.add(b.id);
+  for (const b of lib.items) if (b.id > 0) next.add(b.id);
   selectedIds.value = next;
 }
 
@@ -545,6 +592,23 @@ function onResize() {
     </section>
 
     <div class="filter-bar">
+      <div class="chip-row" role="tablist" aria-label="书架来源筛选">
+        <button
+          v-for="opt in ORIGIN_OPTS"
+          :key="opt.value"
+          type="button"
+          class="chip"
+          :class="{ 'is-active': lib.origin === opt.value }"
+          @click="onOriginClick(opt.value)"
+        >
+          {{ opt.label }}
+        </button>
+        <span v-if="shelfCounts" class="origin-counts muted-xs">
+          共有 {{ shelfCounts.both }} · 仅服务端 {{ shelfCounts.server }} · 仅手机
+          {{ shelfCounts.legado }}
+        </span>
+      </div>
+
       <div class="chip-row" role="tablist" aria-label="书源筛选">
         <button
           v-for="src in SOURCE_OPTS"
@@ -658,7 +722,7 @@ function onResize() {
         :view="viewMode"
         :cover-width="coverWidth"
         :highlight="lib.q"
-        selectable
+        :selectable="b.id > 0"
         :selected="selectedIds.has(b.id)"
         @open="openBook"
         @toggle-select="toggleSelect"
@@ -744,10 +808,113 @@ function onResize() {
         <el-button type="primary" :loading="batchBusy" @click="submitBatchEdit">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- 在线书信息：仅 Legado 书架有，服务端没有正文 -->
+    <el-dialog
+      :model-value="!!onlineDetail"
+      title="手机书架 · 在线书"
+      width="480px"
+      append-to-body
+      @update:model-value="onlineDetail = null"
+    >
+      <div v-if="onlineDetail" v-loading="onlineBusy" class="online-detail">
+        <div class="online-head">
+          <img
+            v-if="onlineDetail.cover_url || onlineDetail.cover_thumb_url"
+            class="online-cover"
+            :src="onlineDetail.cover_url || onlineDetail.cover_thumb_url || ''"
+            :alt="onlineDetail.name"
+          />
+          <div class="online-meta">
+            <h3>{{ onlineDetail.name }}</h3>
+            <p>{{ onlineDetail.author || "佚名" }}</p>
+            <p v-if="onlineDetail.source_name">书源：{{ onlineDetail.source_name }}</p>
+            <p v-if="onlineDetail.latest_chapter">最新：{{ onlineDetail.latest_chapter }}</p>
+            <p v-if="onlineDetail.dur_chapter_title">
+              读到：{{ onlineDetail.dur_chapter_title }}
+            </p>
+            <p v-if="onlineDetail.read_at">时间：{{ onlineDetail.read_at }}</p>
+          </div>
+        </div>
+        <p class="online-intro">{{ onlineDetail.intro || "暂无简介" }}</p>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="正文保存在手机 Legado"
+          description="这本书只在手机书架里，服务端没有正文文件，请在手机端继续阅读。要在本端阅读，可把书导入服务端书库。"
+        />
+        <div v-if="onlineDetail.book_url" class="online-link">
+          <a :href="onlineDetail.book_url" target="_blank" rel="noopener noreferrer">
+            打开书籍源站 ↗
+          </a>
+        </div>
+      </div>
+      <template #footer>
+        <el-button type="primary" @click="onlineDetail = null">知道了</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
+.origin-counts {
+  margin-left: 8px;
+  white-space: nowrap;
+}
+
+/* 在线书信息弹窗 */
+.online-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.online-head {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.online-cover {
+  width: 84px;
+  height: 112px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-2);
+  flex-shrink: 0;
+}
+
+.online-meta {
+  min-width: 0;
+}
+
+.online-meta h3 {
+  margin: 0 0 6px;
+  font-size: var(--text-md);
+  color: var(--color-text);
+}
+
+.online-meta p {
+  margin: 3px 0;
+  font-size: var(--text-xs);
+  color: var(--color-text-2);
+  word-break: break-all;
+}
+
+.online-intro {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--color-text-2);
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.online-link {
+  font-size: var(--text-xs);
+}
+
 .title-row {
   display: flex;
   align-items: center;
