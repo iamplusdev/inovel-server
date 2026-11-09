@@ -1,20 +1,33 @@
 <script setup lang="ts">
 /**
  * API 说明 / Legado 书源（Tab 切换）。
- * 「复制书源」= 复制书源 JSON 的下载 URL。
+ * 「复制书源」= 复制书源 JSON 的下载 URL（带订阅令牌，Legado 无需登录即可导入）。
  */
 import { computed, onMounted, ref } from "vue";
 import { ElMessage } from "element-plus";
 import { http } from "@/api/client";
+import { fetchBookSourceSettings } from "@/api/admin";
 import { useLibraryStore } from "@/stores/library";
 import AppIcon from "@/components/AppIcon.vue";
 
 const lib = useLibraryStore();
 const activeTab = ref("api");
 const apiBase = ref(location.origin);
+const sourceToken = ref("");
 
-const sourceJsonUrl = computed(
-  () => `${apiBase.value.replace(/\/$/, "")}/legado_book_source.json`,
+/**
+ * 书源导入链接必须带订阅令牌：Legado「网络导入」是裸 GET，
+ * 不带令牌会拿到 401 JSON，导入时报 Expected BEGIN_ARRAY but was BEGIN_OBJECT。
+ */
+const sourceJsonUrl = computed(() => {
+  const base = apiBase.value.replace(/\/$/, "");
+  const q = sourceToken.value ? `?token=${encodeURIComponent(sourceToken.value)}` : "";
+  return `${base}/legado_book_source.json${q}`;
+});
+
+/** 手机点一下直接拉起 Legado 导入（Android 支持 legado:// 深链） */
+const legadoDeepLink = computed(
+  () => `legado://import/bookSource?src=${encodeURIComponent(sourceJsonUrl.value)}`,
 );
 
 const publicApis = [
@@ -43,6 +56,15 @@ async function copySourceUrl() {
   }
 }
 
+async function copyDeepLink() {
+  try {
+    await navigator.clipboard.writeText(legadoDeepLink.value);
+    ElMessage.success("Legado 深链已复制，手机浏览器打开即可导入");
+  } catch {
+    ElMessage.warning("复制失败：" + legadoDeepLink.value);
+  }
+}
+
 async function copyText(text: string) {
   try {
     await navigator.clipboard.writeText(text);
@@ -58,6 +80,14 @@ onMounted(async () => {
     if (lib.stats?.public_base_url) apiBase.value = lib.stats.public_base_url;
   } catch {
     /* ignore */
+  }
+  // 订阅令牌：拼进书源导入链接，Legado 才能匿名拉取书源数组
+  try {
+    const cfg = await fetchBookSourceSettings();
+    sourceToken.value = cfg.subscribe_token || "";
+    if (cfg.public_base_url) apiBase.value = cfg.public_base_url;
+  } catch {
+    /* 忽略：退化为不带令牌的链接，页面仍可展示 */
   }
   // 预加载校验书源接口可达
   try {
@@ -127,22 +157,39 @@ onMounted(async () => {
       <div v-else class="tab-panel">
         <h2 class="section-title">书源 JSON</h2>
         <p class="muted">
-          下载后在开源阅读 Legado → 我的 → 书源管理 → 本地导入。接口密钥 X-Api-Key 会随书源自动注入 header，无需手改。
+          手机 Legado → 我的 → 书源管理 → <strong>网络导入</strong>，直接粘贴下面这个完整 URL。
+          接口密钥 X-Api-Key 会随书源自动注入 header，无需手改。
+        </p>
+        <p class="muted warning">
+          链接末尾的 <code>?token=</code> 是订阅令牌，<strong>不能省略</strong>：
+          Legado 导入时无法登录，缺令牌只会拿到 401，导入报
+          <code>Expected BEGIN_ARRAY but was BEGIN_OBJECT</code>。
         </p>
         <div class="url-block">
           <code class="url mono">{{ sourceJsonUrl }}</code>
         </div>
         <div class="actions">
-          <a class="primary-link" :href="sourceJsonUrl" download>
-            <AppIcon name="import" :size="14" />
-            下载书源
-          </a>
-          <button type="button" class="ghost-btn" @click="copySourceUrl">
+          <button type="button" class="primary-link as-btn" @click="copySourceUrl">
             <AppIcon name="copy" :size="14" />
-            复制书源
+            复制导入链接
           </button>
+          <a class="ghost-btn" :href="legadoDeepLink">
+            <AppIcon name="import" :size="14" />
+            手机直接导入
+          </a>
+          <button type="button" class="ghost-btn" @click="copyDeepLink">
+            <AppIcon name="copy" :size="14" />
+            复制深链
+          </button>
+          <a class="ghost-btn" :href="sourceJsonUrl" download>
+            <AppIcon name="import" :size="14" />
+            下载 JSON
+          </a>
         </div>
-        <p class="muted-xs">「复制书源」复制的是书源 JSON 的下载 URL。</p>
+        <p class="muted-xs">
+          「复制导入链接」复制的是带令牌的完整 URL，粘贴到 Legado 网络导入即可；
+          「手机直接导入」用 <code>legado://</code> 深链在手机浏览器点击时激活 Legado。
+        </p>
       </div>
     </section>
   </div>
@@ -276,6 +323,21 @@ onMounted(async () => {
   font-size: var(--text-sm);
   font-weight: 600;
   text-decoration: none;
+}
+
+.primary-link.as-btn {
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.muted.warning {
+  margin-top: -4px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--color-warning, #e6a23c);
+  background: var(--color-surface-2);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  color: var(--color-text-2);
 }
 
 .primary-link:hover {

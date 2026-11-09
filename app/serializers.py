@@ -5,7 +5,8 @@
 """
 from __future__ import annotations
 
-from urllib.parse import quote
+import re
+from urllib.parse import quote, urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.orm import object_session
@@ -13,28 +14,61 @@ from sqlalchemy.orm import object_session
 from .config import normalize_source, parse_category_label, settings
 from .models import Book, Chapter
 
+# 未配置对外地址时的默认值，出现这些 host 说明 PUBLIC_BASE_URL 还是 127.0.0.1
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
+# Host 头只接受常规字符，防「/ @ 空格」之类把基址拼坏
+_HOST_RE = re.compile(r"^[A-Za-z0-9.\-:\[\]]{1,255}$")
+
+
+def _is_loopback_base(url: str) -> bool:
+    """基址是否仍指向本机（PUBLIC_BASE_URL 未配置）。"""
+    if not url:
+        return True
+    try:
+        return (urlsplit(url).hostname or "") in _LOOPBACK_HOSTS
+    except ValueError:
+        return False
+
+
+def _request_base(request) -> str:
+    """按请求头拼 scheme://host；host 非法或缺失时返回空串。"""
+    try:
+        headers = request.headers
+        host = (headers.get("x-forwarded-host") or "").split(",")[0].strip()
+        if not host:
+            host = (headers.get("host") or "").strip()
+        if not host or not _HOST_RE.match(host):
+            return ""
+        proto = (headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+        if not proto:
+            proto = getattr(getattr(request, "url", None), "scheme", None) or "http"
+        return f"{proto}://{host}".rstrip("/")
+    except Exception:  # noqa: BLE001
+        return ""
+
 
 def resolve_base_url(request=None) -> str:
     """推导对外基址：默认固定 PUBLIC_BASE_URL，防 Host 头注入。
 
     仅当请求 Host 命中 TRUSTED_HOSTS 白名单时才采用反代头；未配置白名单时
     一律用 PUBLIC_BASE_URL，避免攻击者伪造 Host 污染返回链接与书源地址。
+
+    例外：PUBLIC_BASE_URL 仍是回环地址（127.0.0.1/localhost，即未配置对外地址）
+    时回退用请求 Host —— 否则域名部署下书源、封面、详情地址会指向手机自己，
+    表现为 Legado「搜索不到、也读不了」。命中白名单的 Host 优先于该回退。
     """
     fixed = (settings.public_base_url or "").rstrip("/")
-    if request is None or not settings.trusted_hosts:
+    if request is None:
         return fixed
-    try:
-        headers = request.headers
-        host = (headers.get("x-forwarded-host") or "").split(",")[0].strip()
-        if not host:
-            host = (headers.get("host") or "").strip()
-        if host and host.lower() in {h.lower() for h in settings.trusted_hosts}:
-            proto = (headers.get("x-forwarded-proto") or "").split(",")[0].strip()
-            if not proto:
-                proto = getattr(getattr(request, "url", None), "scheme", None) or "http"
-            return f"{proto}://{host}".rstrip("/")
-    except Exception:  # noqa: BLE001
-        pass
+    from_request = _request_base(request)
+    if not from_request:
+        return fixed
+    trusted = {h.lower() for h in settings.trusted_hosts}
+    host = from_request.split("://", 1)[-1].lower()
+    if trusted and host in trusted:
+        return from_request
+    if _is_loopback_base(fixed):
+        return from_request
     return fixed
 
 

@@ -14,7 +14,6 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .auth import require_read_dep
 from .config import settings
 from .database import init_db
 from .logging_setup import setup_logging
@@ -90,8 +89,18 @@ app.mount("/covers", StaticFiles(directory=str(settings.covers_dir)), name="cove
 
 
 @app.get("/legado_book_source.json", include_in_schema=False)
-def legado_source_file(request: Request, _user: str = Depends(require_read_dep)) -> list:
-    """书源 JSON：注入当前基址与读接口 Key，供 Legado 直接导入。"""
+def legado_source_file(
+    request: Request, _auth: str = Depends(book_sources.verify_subscribe)
+) -> list:
+    """书源 JSON：注入当前基址与读接口 Key，供 Legado 直接导入。
+
+    Legado「网络导入」是裸 GET（不带 Cookie、也不带自定义 Header），只认会话会
+    让手机端拿到 401 的 {"detail": ...} 对象，gson 随即报
+    「Expected BEGIN_ARRAY but was BEGIN_OBJECT」。所以这里复用书源订阅令牌
+    （?token=xxx，管理页可重置），并兼容 ?key= / X-Api-Key / 已登录会话。
+    """
+    # 令牌未生成时先落盘，保证与「书源管理 → 订阅链接」展示的是同一个
+    book_sources.book_source_settings.ensure_token()
     return legado.build_book_source(request)
 
 
