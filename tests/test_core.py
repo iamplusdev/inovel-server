@@ -1705,6 +1705,93 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(db.get(Book, bid).read_chapter_index, 1)
         db.close()
 
+    def test_sync_pull_all_ignores_books_outside_library(self) -> None:
+        """手机书架大于服务端书库时：书库外的进度文件只统计、不 GET、不写库、不报错。"""
+        import json
+        import time
+        from unittest import mock
+        from urllib.parse import unquote
+
+        from app import sync_progress
+        from app.models import Book, Chapter
+
+        s = self.db.SessionLocal()
+        b1 = Book(title="书架里的书A", author="作者", category="都市", chapter_count=2)
+        b2 = Book(title="书架里的书B", author="作者", category="都市", chapter_count=2)
+        s.add_all([b1, b2])
+        s.flush()
+        for b in (b1, b2):
+            s.add_all(
+                [
+                    Chapter(book_id=b.id, index=0, title="第一章", content="a"),
+                    Chapter(book_id=b.id, index=1, title="第二章", content="b"),
+                ]
+            )
+        s.commit()
+        ids = (b1.id, b2.id)
+        s.close()
+
+        matching = ["书架里的书A_作者.json", "书架里的书B_作者.json"]
+        outside = [
+            "手机独有的书1_作者.json",
+            "手机独有的书2_作者.json",
+            "手机独有的书3_作者.json",
+        ]
+        remote_ms = int(time.time() * 1000) + 1000
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.gets: list[str] = []
+
+            def list_files(self, url):
+                return matching + outside
+
+            def get(self, url):
+                decoded = unquote(url.rsplit("/", 1)[-1])
+                self.gets.append(decoded)
+                if decoded in matching:
+                    return json.dumps(
+                        {
+                            "name": decoded.split("_")[0],
+                            "author": "作者",
+                            "durChapterIndex": 1,
+                            "durChapterPos": 10,
+                            "durChapterTime": remote_ms,
+                            "durChapterTitle": "第二章",
+                        }
+                    ).encode()
+                return None
+
+        settings = {
+            "enabled": True, "url": "https://dav.example.com/dav",
+            "username": "u", "password": "p", "dir": "legado",
+            "timeout": 6, "verify_tls": True,
+        }
+        fake = FakeClient()
+        with mock.patch.object(
+            sync_progress.webdav_settings, "load", return_value=settings
+        ), mock.patch.object(sync_progress, "_client", return_value=fake):
+            db = self.db.SessionLocal()
+            result = sync_progress.pull_all(db)
+            db.close()
+
+        self.assertTrue(result["enabled"])
+        self.assertTrue(result["listed"])
+        self.assertEqual(result["remote_files"], 5)
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["ignored"], 3)
+        self.assertIn("手机独有的书1_作者.json", result["ignored_sample"])
+        self.assertEqual(result["scanned"], 2)
+        self.assertEqual(result["errors"], 0)
+        self.assertEqual(result["updated"], 2)
+        # 书库外文件连 GET 都不应发出，避免手机端书籍多时拖慢同步
+        self.assertEqual(len(fake.gets), 2)
+        db = self.db.SessionLocal()
+        self.assertEqual(db.query(Book).count(), 2)  # 没有凭空创建书库外的书
+        for bid in ids:
+            self.assertEqual(db.get(Book, bid).read_chapter_index, 1)
+        db.close()
+
     def test_sync_pull_all_endpoint(self) -> None:
         """POST /api/admin/sync/pull-all 端点：鉴权挂载 + 写回 DB + 响应结构。"""
         import json

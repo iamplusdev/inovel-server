@@ -240,18 +240,34 @@ def pull_progress(
 
 
 def pull_all(db: Session, limit: int = 300) -> dict:
-    """书库打开时批量拉取 WebDAV 进度（客户端按需调用，不做服务端定时同步）。
+    """书库打开时批量拉取 WebDAV 进度（两端按需调用，不做服务端定时同步）。
 
-    一次 PROPFIND 列出 Legado 写过的 bookProgress 文件 → 按 {书名}_{作者}.json
-    匹配书库 → 逐本复用 pull_progress 的「最新者胜」比对。这样：
-    - 手机 Legado 读过的书，即使本机/服务端此前从未读过，也会出现在继续阅读里；
-    - 未产生过进度文件的书不会发出任何 GET 请求。
+    范围严格限定为「书库（书架）中已存在的书籍」：手机 Legado 的书架通常比
+    服务端书库大，WebDAV 里会有大量书库外书籍的进度文件，这些文件一律忽略
+    —— 不创建书籍、不写进度、不计入错误，继续阅读/最新阅读也不会出现它们。
 
-    WebDAV 不支持列目录时降级为「只扫描已有本地进度的书」，保证基本可用。
+    流程：一次 PROPFIND 列出 bookProgress 下的 .json 进度文件 → 按
+    {书名}_{作者}.json 精确匹配书库 → 逐本复用 pull_progress 的「最新者胜」。
+    返回 remote_files/matched/ignored/ignored_sample 便于排查「为什么某本书
+    没同步」（是书库外，还是文件名对不上）。
+
+    WebDAV 不支持列目录时降级为「只扫描已有本地进度的书」，同样只涉及书库内书籍。
     """
+    empty = {
+        "enabled": False,
+        "listed": False,
+        "remote_files": 0,
+        "matched": 0,
+        "ignored": 0,
+        "ignored_sample": [],
+        "scanned": 0,
+        "updated": 0,
+        "errors": 0,
+        "books": [],
+    }
     settings = webdav_settings.load()
     if not webdav_settings.is_configured(settings):
-        return {"enabled": False, "listed": False, "scanned": 0, "updated": 0, "books": []}
+        return empty
 
     books = db.execute(select(Book)).scalars().all()
     by_filename: dict[str, Book] = {}
@@ -261,17 +277,46 @@ def pull_all(db: Session, limit: int = 300) -> dict:
 
     client = _client(settings)
     listed = True
+    remote_files = 0
+    ignored = 0
+    ignored_sample: list[str] = []
+    candidates: list[Book] = []
     try:
         names = client.list_files(progress_dir_url(settings))
-        candidates = [by_filename[n] for n in names if n in by_filename]
+        remote_files = len(names)
+        # 书库外的进度文件：只统计文件名用于诊断，不 GET、不写库、不报错
+        unmatched = [n for n in names if n not in by_filename]
+        ignored = len(unmatched)
+        ignored_sample = unmatched[:10]
+        seen: set[int] = set()
+        for name in names:
+            book = by_filename.get(name)
+            if book is None:
+                continue
+            key = int(book.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(book)
     except Exception as exc:  # noqa: BLE001
         logger.warning("列出远程进度目录失败，降级扫描已有进度书籍: %s", exc)
         listed = False
+        remote_files = 0
+        ignored = 0
+        ignored_sample = []
         # 注意 read_chapter_index=0 是合法的「读过第一章」，不能用 `or -1` 兜底
         candidates = [
             b for b in books
             if int(b.read_chapter_index if b.read_chapter_index is not None else -1) >= 0
         ]
+
+    matched = len(candidates)
+    if ignored:
+        logger.info(
+            "批量进度同步：忽略 %d/%d 个书库外的 Legado 进度文件（手机书架大于服务端书库）",
+            ignored,
+            remote_files,
+        )
 
     scanned = 0
     updated: list[dict] = []
@@ -298,6 +343,10 @@ def pull_all(db: Session, limit: int = 300) -> dict:
     return {
         "enabled": True,
         "listed": listed,
+        "remote_files": remote_files,
+        "matched": matched,
+        "ignored": ignored,
+        "ignored_sample": ignored_sample,
         "scanned": scanned,
         "updated": len(updated),
         "errors": errors,

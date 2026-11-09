@@ -6,7 +6,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { SOURCE_OPTS, useLibraryStore } from "@/stores/library";
-import { batchDeleteBooks, batchUpdateBooks, fetchBooks } from "@/api/admin";
+import { batchDeleteBooks, batchUpdateBooks, fetchBooks, pullAllBookProgress } from "@/api/admin";
 import type { BatchUpdateBody } from "@/api/admin";
 import { startBatchScrape } from "@/api/progress";
 import type { BookListItem } from "@/api/types";
@@ -264,6 +264,34 @@ async function loadContinue() {
   }
 }
 
+// —— 书库打开时从 WebDAV 批量同步进度（与 Windows 端行为一致） ——
+// 只同步书库中已存在的书籍：手机 Legado 书架通常比服务端书库大，书库外的
+// 进度文件由服务端直接忽略，因此「继续阅读」永远只展示书架里存在的书。
+const PROGRESS_SYNC_THROTTLE = 15_000;
+let lastProgressSyncAt = 0;
+let syncingProgress = false;
+
+async function syncContinueFromWebDAV(): Promise<void> {
+  if (syncingProgress || Date.now() - lastProgressSyncAt < PROGRESS_SYNC_THROTTLE) return;
+  syncingProgress = true;
+  lastProgressSyncAt = Date.now();
+  try {
+    const res = await pullAllBookProgress();
+    console.debug(
+      `[sync] WebDAV 批量进度：远端 ${res.remote_files} 个文件 / 命中书库 ${res.matched} 本 / 忽略书库外 ${res.ignored} 个 / 更新 ${res.updated} 本`,
+    );
+    if (res.updated > 0) {
+      // DB 进度已变：刷新继续阅读卡片与封面进度条（不阻塞首屏）
+      await Promise.all([loadContinue(), lib.loadBooks()]);
+    }
+  } catch {
+    // WebDAV 未配置 / 网络异常 / 接口 404（旧服务端）：静默降级，
+    // 继续阅读仍展示本地 DB 里的进度
+  } finally {
+    syncingProgress = false;
+  }
+}
+
 function toggleSelect(id: number) {
   const next = new Set(selectedIds.value);
   if (next.has(id)) next.delete(id);
@@ -398,6 +426,8 @@ async function loadAll() {
   loadError.value = "";
   try {
     await Promise.all([lib.loadStats(), lib.loadBooks(), loadContinue()]);
+    // 后台同步，不阻塞书库首屏；有更新时同步函数内部会刷新卡片与书库列表
+    void syncContinueFromWebDAV();
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : "加载失败，请稍后重试";
   } finally {

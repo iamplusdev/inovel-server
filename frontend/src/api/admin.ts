@@ -256,6 +256,33 @@ export function pullBookProgress(bookId: number | string) {
   return http.post<PullProgressResult>(`/api/admin/books/${bookId}/sync/pull`);
 }
 
+/** 书库打开时批量拉取 WebDAV 进度（只同步书库中已存在的书籍） */
+export interface PullAllProgressResult {
+  enabled: boolean;
+  listed: boolean;
+  /** 远端 bookProgress 下的进度文件总数 */
+  remote_files: number;
+  /** 命中书库的书籍数 */
+  matched: number;
+  /** 书库外、被忽略的进度文件数（手机书架往往比服务端书库大） */
+  ignored: number;
+  /** 被忽略文件名样例，便于排查「某本书为何没同步」 */
+  ignored_sample: string[];
+  scanned: number;
+  updated: number;
+  errors: number;
+  books: Array<{
+    book_id: number;
+    chapter_id?: number;
+    chapter_index?: number;
+    remote_time?: number;
+  }>;
+}
+
+export function pullAllBookProgress() {
+  return http.post<PullAllProgressResult>("/api/admin/sync/pull-all");
+}
+
 /** 详情页同步诊断 */
 export interface SyncInfo {
   enabled: boolean;
