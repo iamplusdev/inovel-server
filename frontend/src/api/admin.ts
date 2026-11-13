@@ -120,6 +120,27 @@ export function tocNo(index: number): number {
   return (Number(index) || 0) + 1;
 }
 
+/** 详情页目录分页响应（服务端已过滤伪占位行） */
+export interface BookTocPage {
+  book_id: number;
+  q: string;
+  page: number;
+  page_size: number;
+  /** 当前查询命中总数（筛选时为匹配数） */
+  total: number;
+  /** 全书有效章节总数（不受筛选影响） */
+  book_total: number;
+  items: (TocChapter & { no: number })[];
+}
+
+/** 详情页目录：按页/关键词从服务端取，避免大部头一次拉全量 */
+export function fetchBookToc(
+  bookId: number | string,
+  params: { page?: number; page_size?: number; q?: string } = {},
+) {
+  return http.get<BookTocPage>(`/api/admin/books/${bookId}/toc`, params);
+}
+
 /** 目录标题：空标题或与书名重复时返回空（由序号列展示），避免出现「0 书名」伪条目 */
 export function tocTitle(
   title: string | undefined | null,
@@ -270,6 +291,8 @@ export interface PullAllProgressResult {
   ignored: number;
   /** 被忽略文件名样例，便于排查「某本书为何没同步」 */
   ignored_sample: string[];
+  /** mtime 预筛跳过的文件数（远端没更新，未发 GET） */
+  skipped?: number;
   scanned: number;
   updated: number;
   errors: number;
@@ -278,6 +301,9 @@ export interface PullAllProgressResult {
     chapter_id?: number;
     chapter_index?: number;
     remote_time?: number;
+    /** 本次同步后的最终进度，供卡片原地更新 */
+    read_percent?: number;
+    read_at?: string;
   }>;
 }
 

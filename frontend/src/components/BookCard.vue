@@ -13,6 +13,8 @@ const props = withDefaults(
     view?: "grid" | "list";
     selectable?: boolean;
     selected?: boolean;
+    /** 批量选择模式：点击卡片切换勾选，而不是打开书籍 */
+    selectMode?: boolean;
     /** 网格封面宽度（px），用于小卡降级展示 */
     coverWidth?: number;
     /** 书库搜索关键词，用于标题/作者/标签高亮 */
@@ -22,6 +24,7 @@ const props = withDefaults(
     view: "grid",
     selectable: false,
     selected: false,
+    selectMode: false,
     coverWidth: 150,
     highlight: "",
   },
@@ -104,7 +107,11 @@ function onCoverError(e: Event) {
 }
 
 function onClick() {
-  if (props.selectable && props.selected) return;
+  // 批量模式下，可选卡片点击即勾选/取消；不可选的（仅手机在线书）仍打开详情
+  if (props.selectMode && props.selectable) {
+    emit("toggle-select", props.book.id);
+    return;
+  }
   emit("open", props.book.id);
 }
 
@@ -123,7 +130,11 @@ function statusClass(status: string) {
 <template>
   <article
     class="book-card"
-    :class="[`is-${view}`, `size-${sizeTier}`, { 'is-selected': selected }]"
+    :class="[
+      `is-${view}`,
+      `size-${sizeTier}`,
+      { 'is-selected': selected, 'is-select-mode': selectMode },
+    ]"
     tabindex="0"
     role="link"
     @click="onClick"
@@ -341,7 +352,8 @@ function statusClass(status: string) {
 }
 
 .book-card:hover .select-box,
-.book-card.is-selected .select-box {
+.book-card.is-selected .select-box,
+.book-card.is-select-mode .select-box {
   opacity: 1;
 }
 

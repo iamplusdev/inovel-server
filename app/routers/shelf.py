@@ -180,3 +180,15 @@ def shelf_book_delete(shelf_id: int, db: Session = Depends(get_db)) -> dict:
     db.delete(row)
     db.commit()
     return {"deleted": shelf_id}
+
+
+@router.post("/books/{shelf_id}/adopt")
+def shelf_book_adopt(shelf_id: int, db: Session = Depends(get_db)) -> dict:
+    """把手机书架里的在线书登记为服务端在线书，之后 PC/网页即可直接阅读。"""
+    row = db.get(LegadoShelfBook, shelf_id)
+    if row is None:
+        raise HTTPException(404, "书架条目不存在")
+    try:
+        return br.adopt_shelf_book(db, row)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc

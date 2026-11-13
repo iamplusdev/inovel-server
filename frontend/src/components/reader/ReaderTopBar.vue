@@ -11,6 +11,8 @@ defineProps<{
   tocOpen: boolean;
   searchOpen: boolean;
   settingsOpen: boolean;
+  sourceOpen: boolean;
+  online: boolean;
   syncState: ReaderSyncState;
 }>();
 
@@ -18,6 +20,7 @@ const emit = defineEmits<{
   (e: "back"): void;
   (e: "toggle-toc"): void;
   (e: "toggle-search"): void;
+  (e: "toggle-sources"): void;
   (e: "toggle-settings"): void;
   (e: "fullscreen"): void;
   (e: "apply-remote"): void;
@@ -71,6 +74,16 @@ const emit = defineEmits<{
         @click="emit('toggle-search')"
       >
         <AppIcon name="search" :size="18" />
+      </button>
+      <button
+        v-if="online"
+        type="button"
+        class="icon-btn"
+        :class="{ 'is-on': sourceOpen }"
+        title="切换书源"
+        @click="emit('toggle-sources')"
+      >
+        <AppIcon name="refresh" :size="18" />
       </button>
       <button
         type="button"

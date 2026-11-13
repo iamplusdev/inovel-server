@@ -25,6 +25,8 @@ import {
 import type { ShelfCompare, ShelfPreview, ShelfRestoreResult } from "@/api/types";
 import AppIcon from "@/components/AppIcon.vue";
 
+defineProps<{ embedded?: boolean }>();
+
 const backups = ref<ShelfBackupFile[]>([]);
 const backupError = ref("");
 const configReady = ref(false);
@@ -237,7 +239,7 @@ onMounted(() => {
 
 <template>
   <div class="page shelf-page">
-    <header class="page-header">
+    <header v-if="!embedded" class="page-header">
       <h1 class="page-title">书架对照 / 备份恢复</h1>
       <p class="page-subtitle">
         从 Legado 的 WebDAV 备份恢复书源与书架，并拆成「双端共有 / 仅服务端 / 仅手机在线」三部分。

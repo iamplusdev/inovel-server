@@ -723,6 +723,63 @@ def online_item(row: LegadoShelfBook, base: str = "") -> dict:
     }
 
 
+def _source_for_shelf(db: Session, row: LegadoShelfBook) -> BookSource | None:
+    """书架条目的 origin(bookSourceUrl) 对应到已导入书源；名称唯一时兜底。"""
+    if row.origin:
+        found = db.execute(
+            select(BookSource).where(BookSource.source_url == row.origin)
+        ).scalars().first()
+        if found is not None:
+            return found
+    if row.origin_name:
+        hits = list(db.execute(
+            select(BookSource).where(BookSource.name == row.origin_name)
+        ).scalars().all())
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
+def adopt_shelf_book(db: Session, row: LegadoShelfBook) -> dict:
+    """把「仅 Legado 有」的书架条目登记为服务端在线书，正文仍按需抓取。
+
+    只登记元数据（与在线搜索「加入书库」共用同一套逻辑）；需要该条目的
+    origin 已作为书源导入服务端，否则无法解析目录/正文。
+    """
+    from . import online_search
+
+    if not row.book_url:
+        raise ValueError("条目缺少书籍地址，无法转为在线书")
+    source_row = _source_for_shelf(db, row)
+    if source_row is None:
+        raise ValueError("未找到对应书源，请先在「接入 → 书源管理」导入该来源后重试")
+    try:
+        result = online_search.add_to_library(db, {
+            "source_id": int(source_row.id),
+            "name": row.name,
+            "author": row.author,
+            "book_url": row.book_url,
+            "toc_url": row.toc_url,
+            "cover_url": row.cover_url,
+            "intro": row.intro,
+            "kind": row.kind,
+            "last_chapter": row.latest_chapter,
+            "word_count": int(row.word_count or 0),
+        })
+    except online_search.OnlineSearchError as exc:
+        raise ValueError(str(exc)) from exc
+    row.book_id = int(result["book_id"])
+    db.commit()
+    return {
+        "ok": True,
+        "book_id": int(result["book_id"]),
+        "created": bool(result.get("created")),
+        "title": result.get("title") or row.name,
+        "source_name": source_row.name,
+        "readable": True,
+    }
+
+
 def server_item(book: Book, base: str = "", state: dict | None = None) -> dict:
     item = book_list_item(book, base)
     rows = getattr(book, "_shelf_rows", None)
@@ -730,8 +787,8 @@ def server_item(book: Book, base: str = "", state: dict | None = None) -> dict:
         rows = [r for r in state["shelf_books"] if r.book_id == int(book.id)]
     rows = rows or []
     item["origin"] = "both" if rows else "server"
-    # 在线搜索登记的书没有本地正文，不能进阅读器
-    item["readable"] = not item.get("online", False)
+    # 在线搜索登记的书由服务端按需抓取目录/正文，同样可进阅读器
+    item["readable"] = True
     item["shelf_id"] = int(rows[0].id) if rows else None
     item["source_name"] = rows[0].origin_name if rows else ""
     # 有手机书架记录时用书架里的原始地址；在线搜索登记的书沿用书目自带的 book_url

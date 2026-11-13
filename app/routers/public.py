@@ -13,6 +13,8 @@ from ..book_query import build_books_stmt, count_books
 from ..config import all_category_labels
 from ..database import get_db
 from ..models import Book, Chapter
+from ..online_reader import OnlineReadError, ensure_chapter_content, ensure_toc
+from ..online_search import is_online_book
 from ..serializers import (
     book_detail,
     book_list_item,
@@ -175,6 +177,12 @@ def list_chapters(
     book = db.get(Book, book_id)
     if not book:
         raise HTTPException(404, "书籍不存在")
+    if is_online_book(book):
+        # 在线书首次打开：把书源目录落成普通章节行，之后按本地目录读取
+        try:
+            ensure_toc(db, book)
+        except OnlineReadError as exc:
+            raise HTTPException(502, str(exc)) from exc
     offset, limit = _paginate(page, page_size, max_size=500)
     total = db.execute(
         select(func.count()).select_from(Chapter).where(Chapter.book_id == book_id)
@@ -205,6 +213,14 @@ def get_chapter(
     ch = db.get(Chapter, chapter_id)
     if not ch or ch.book_id != book_id:
         raise HTTPException(404, "章节不存在")
+    book = db.get(Book, book_id)
+    if book is not None and is_online_book(book) and not (ch.content or ""):
+        if int(ch.content_length or 0) <= 0:
+            # 在线书按需抓正文；抓取成功即写入正文包，下次直接命中缓存
+            try:
+                ensure_chapter_content(db, book, ch)
+            except OnlineReadError as exc:
+                raise HTTPException(502, str(exc)) from exc
     data = chapter_content(ch, resolve_base_url(request))
     etag = '"%s"' % hashlib.sha1((data.get("content") or "").encode("utf-8")).hexdigest()
     headers = {"ETag": etag, "Cache-Control": "no-cache"}

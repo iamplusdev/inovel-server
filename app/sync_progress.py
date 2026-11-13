@@ -11,8 +11,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote, unquote
 
 from sqlalchemy import select
@@ -26,6 +29,12 @@ logger = logging.getLogger("sync")
 
 # Legado 的 normalizeFileName：把非法文件名字符替换为下划线
 _BAD_FILENAME = re.compile(r'[\\/:*?"<>|]')
+
+# 批量同步的 WebDAV GET 并发数：单请求通常 100ms+，适度并发缩短首次同步耗时
+PULL_FETCH_WORKERS = 4
+# mtime 预筛的时钟容差：Legado 用手机时钟写内容、WebDAV 服务端记 mtime，
+# 两者可能差几分钟；只有远端文件明显旧于本地进度时才跳过 GET
+MTIME_SKEW_MS = 5 * 60 * 1000
 
 
 def progress_filename(name: str, author: str) -> str:
@@ -105,6 +114,14 @@ def _ms_to_iso(ms: int) -> str:
         return datetime.now().isoformat(timespec="seconds")
 
 
+def _http_date_to_ms(value: str) -> int:
+    """解析 WebDAV 的 getlastmodified（RFC 1123），无法解析时返回 0。"""
+    try:
+        return int(parsedate_to_datetime(value).timestamp() * 1000)
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return 0
+
+
 def _norm_title(title: str) -> str:
     return re.sub(r"\s+", "", (title or "")).lower()
 
@@ -168,7 +185,13 @@ def pull_progress(
             "filename": filename,
             "error": str(exc),
         }
+    return _apply_remote_progress(db, book, raw, filename)
 
+
+def _apply_remote_progress(
+    db: Session, book: Book, raw: bytes | None, filename: str
+) -> dict:
+    """把已取到的远端进度写回 DB（「最新者胜」），网络请求由调用方负责。"""
     if raw is None:
         return {"enabled": True, "found": False, "updated": False, "filename": filename}
 
@@ -182,7 +205,7 @@ def pull_progress(
             "error": "远端进度格式无法识别",
         }
 
-    chapters = _chapters(db, book_id)
+    chapters = _chapters(db, int(book.id))
     chapter = resolve_chapter(chapters, remote)
     base = {
         "enabled": True,
@@ -239,17 +262,20 @@ def pull_progress(
     }
 
 
-def pull_all(db: Session, limit: int = 300) -> dict:
+def pull_all(db: Session, limit: int = 0) -> dict:
     """书库打开时批量拉取 WebDAV 进度（两端按需调用，不做服务端定时同步）。
 
     范围严格限定为「书库（书架）中已存在的书籍」：手机 Legado 的书架通常比
     服务端书库大，WebDAV 里会有大量书库外书籍的进度文件，这些文件一律忽略
     —— 不创建书籍、不写进度、不计入错误，继续阅读/最新阅读也不会出现它们。
 
-    流程：一次 PROPFIND 列出 bookProgress 下的 .json 进度文件 → 按
-    {书名}_{作者}.json 精确匹配书库 → 逐本复用 pull_progress 的「最新者胜」。
-    返回 remote_files/matched/ignored/ignored_sample 便于排查「为什么某本书
-    没同步」（是书库外，还是文件名对不上）。
+    流程：一次 PROPFIND 列出 bookProgress 下的 .json 进度文件（含 getlastmodified）
+    → 按 {书名}_{作者}.json 精确匹配书库 → 用 mtime 预筛掉「远端明显不比本地新」
+    的文件（省掉绝大多数 GET）→ 剩余文件小并发拉取 → 单线程按「最新者胜」写库。
+
+    返回 remote_files/matched/ignored/ignored_sample/skipped 便于排查「为什么
+    某本书没同步」（书库外、文件名对不上，还是远端没更新）。
+    limit=0 表示不限制（旧实现默认 300，书库较大时会静默漏同步）。
 
     WebDAV 不支持列目录时降级为「只扫描已有本地进度的书」，同样只涉及书库内书籍。
     """
@@ -260,6 +286,7 @@ def pull_all(db: Session, limit: int = 300) -> dict:
         "matched": 0,
         "ignored": 0,
         "ignored_sample": [],
+        "skipped": 0,
         "scanned": 0,
         "updated": 0,
         "errors": 0,
@@ -281,16 +308,17 @@ def pull_all(db: Session, limit: int = 300) -> dict:
     ignored = 0
     ignored_sample: list[str] = []
     candidates: list[Book] = []
+    remote_mtime: dict[int, int] = {}
     try:
-        names = client.list_files(progress_dir_url(settings))
-        remote_files = len(names)
+        files = client.list_files(progress_dir_url(settings))
+        remote_files = len(files)
         # 书库外的进度文件：只统计文件名用于诊断，不 GET、不写库、不报错
-        unmatched = [n for n in names if n not in by_filename]
+        unmatched = [f["name"] for f in files if f["name"] not in by_filename]
         ignored = len(unmatched)
         ignored_sample = unmatched[:10]
         seen: set[int] = set()
-        for name in names:
-            book = by_filename.get(name)
+        for item in files:
+            book = by_filename.get(item["name"])
             if book is None:
                 continue
             key = int(book.id)
@@ -298,6 +326,9 @@ def pull_all(db: Session, limit: int = 300) -> dict:
                 continue
             seen.add(key)
             candidates.append(book)
+            mtime = _http_date_to_ms(item.get("modified") or "")
+            if mtime:
+                remote_mtime[key] = mtime
     except Exception as exc:  # noqa: BLE001
         logger.warning("列出远程进度目录失败，降级扫描已有进度书籍: %s", exc)
         listed = False
@@ -318,13 +349,51 @@ def pull_all(db: Session, limit: int = 300) -> dict:
             remote_files,
         )
 
-    scanned = 0
+    # mtime 预筛：远端文件没改过（明显旧于本地 read_at）就不必再发 GET。
+    # 保留时钟容差，避免手机与 WebDAV 服务端时钟偏差导致误跳过。
+    pending: list[tuple[Book, str]] = []
+    skipped = 0
+    for book in candidates:
+        local_ms = _iso_to_ms(book.read_at)
+        mtime = remote_mtime.get(int(book.id), 0)
+        if local_ms and mtime and mtime + MTIME_SKEW_MS <= local_ms:
+            skipped += 1
+            continue
+        pending.append((book, progress_filename(book.title, book.author)))
+    if limit > 0:
+        pending = pending[:limit]
+
+    # 并发只发生在网络阶段；URL 生成与后续写库都在当前线程/会话里完成。
+    # 每个线程一个 WebDAV client：urllib 的 opener 不承诺线程安全。
+    thread_state = threading.local()
+
+    def _worker_client() -> WebDavClient:
+        worker = getattr(thread_state, "client", None)
+        if worker is None:
+            worker = thread_state.client = _client(settings)
+        return worker
+
+    def _fetch(job: tuple[Book, str]) -> tuple[Book, str, bytes | None, str | None]:
+        book, filename = job
+        try:
+            return book, filename, _worker_client().get(progress_url(settings, filename)), None
+        except Exception as exc:  # noqa: BLE001
+            return book, filename, None, str(exc)
+
+    fetched: list[tuple[Book, str, bytes | None, str | None]] = []
+    if pending:
+        with ThreadPoolExecutor(max_workers=min(PULL_FETCH_WORKERS, len(pending))) as pool:
+            fetched = list(pool.map(_fetch, pending))
+
     updated: list[dict] = []
     errors = 0
-    for book in candidates[: max(1, min(limit, 1000))]:
-        scanned += 1
+    for book, filename, raw, error in fetched:
+        if error is not None:
+            logger.warning("批量同步失败 book=%s: %s", book.id, error)
+            errors += 1
+            continue
         try:
-            result = pull_progress(db, int(book.id), client=client, settings=settings)
+            result = _apply_remote_progress(db, book, raw, filename)
         except Exception as exc:  # noqa: BLE001
             logger.warning("批量同步失败 book=%s: %s", book.id, exc)
             errors += 1
@@ -332,12 +401,16 @@ def pull_all(db: Session, limit: int = 300) -> dict:
         if result.get("error"):
             errors += 1
         if result.get("updated"):
+            # 进度已写回同一个 session 里的 book 实例，
+            # 这里带上卡片渲染所需的最终字段，客户端可原地更新单张卡片
             updated.append(
                 {
                     "book_id": int(book.id),
                     "chapter_id": result.get("chapter_id"),
                     "chapter_index": result.get("chapter_index"),
                     "remote_time": result.get("remote_time"),
+                    "read_percent": int(book.read_percent or 0),
+                    "read_at": book.read_at or "",
                 }
             )
     return {
@@ -347,7 +420,8 @@ def pull_all(db: Session, limit: int = 300) -> dict:
         "matched": matched,
         "ignored": ignored,
         "ignored_sample": ignored_sample,
-        "scanned": scanned,
+        "skipped": skipped,
+        "scanned": len(fetched),
         "updated": len(updated),
         "errors": errors,
         "books": updated,

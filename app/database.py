@@ -42,6 +42,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_books()
     _migrate_read_progress()
+    _migrate_online_reading()
     _migrate_chapters_storage()
     _migrate_indexes()
     _init_fts()
@@ -87,6 +88,32 @@ def _migrate_read_progress() -> None:
             conn.execute(text("ALTER TABLE books ADD COLUMN read_chapter_index INTEGER NOT NULL DEFAULT -1"))
         if "read_at" not in cols:
             conn.execute(text("ALTER TABLE books ADD COLUMN read_at VARCHAR(30) NOT NULL DEFAULT ''"))
+        conn.commit()
+
+
+def _migrate_online_reading() -> None:
+    """在线书阅读：书补来源/目录地址，章节补原站地址。"""
+    with engine.connect() as conn:
+        rows = conn.execute(text("PRAGMA table_info(books)")).fetchall()
+        cols = {r[1] for r in rows}
+        if "remote_source_id" not in cols:
+            conn.execute(
+                text("ALTER TABLE books ADD COLUMN remote_source_id INTEGER NOT NULL DEFAULT 0")
+            )
+        if "remote_book_url" not in cols:
+            conn.execute(
+                text("ALTER TABLE books ADD COLUMN remote_book_url VARCHAR(1000) NOT NULL DEFAULT ''")
+            )
+        if "remote_toc_url" not in cols:
+            conn.execute(
+                text("ALTER TABLE books ADD COLUMN remote_toc_url VARCHAR(1000) NOT NULL DEFAULT ''")
+            )
+        rows = conn.execute(text("PRAGMA table_info(chapters)")).fetchall()
+        cols = {r[1] for r in rows}
+        if "remote_url" not in cols:
+            conn.execute(
+                text("ALTER TABLE chapters ADD COLUMN remote_url VARCHAR(1000) NOT NULL DEFAULT ''")
+            )
         conn.commit()
 
 

@@ -10,6 +10,8 @@ import { fetchBookSourceSettings } from "@/api/admin";
 import { useLibraryStore } from "@/stores/library";
 import AppIcon from "@/components/AppIcon.vue";
 
+defineProps<{ embedded?: boolean }>();
+
 const lib = useLibraryStore();
 const activeTab = ref("api");
 const apiBase = ref(location.origin);
@@ -100,12 +102,12 @@ onMounted(async () => {
 
 <template>
   <div class="page api-page">
-    <header class="page-header">
+    <header v-if="!embedded" class="page-header">
       <h1 class="page-title">API / 书源</h1>
     </header>
 
     <section class="page-card tabs-card">
-      <div class="tab-nav" role="tablist">
+      <div v-if="!embedded" class="tab-nav" role="tablist">
         <button
           type="button"
           class="tab-btn"
@@ -124,7 +126,7 @@ onMounted(async () => {
         </button>
       </div>
 
-      <div v-if="activeTab === 'api'" class="tab-panel">
+      <div v-if="embedded || activeTab === 'api'" class="tab-panel">
         <h2 class="section-title">服务地址</h2>
         <div class="url-block">
           <code class="url mono">{{ apiBase }}</code>
@@ -154,7 +156,11 @@ onMounted(async () => {
         </ul>
       </div>
 
-      <div v-else class="tab-panel">
+      <div
+        v-if="embedded || activeTab === 'source'"
+        class="tab-panel"
+        :class="{ 'is-embedded': embedded }"
+      >
         <h2 class="section-title">书源 JSON</h2>
         <p class="muted">
           手机 Legado → 我的 → 书源管理 → <strong>网络导入</strong>，直接粘贴下面这个完整 URL。
@@ -198,6 +204,13 @@ onMounted(async () => {
 <style scoped>
 .tabs-card {
   padding: var(--space-3) var(--space-4) var(--space-4);
+}
+
+/* 嵌入「接入」分组时两个面板顺序铺开，用分隔线代替页签 */
+.tab-panel.is-embedded {
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
 }
 
 .tab-nav {

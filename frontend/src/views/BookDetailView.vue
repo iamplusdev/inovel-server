@@ -2,25 +2,20 @@
 /**
  * 书籍详情编辑：书名/作者/两级分类/状态/标签/简介、封面上传、删除、章节预览。
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
   deleteBook,
-  fetchAllBookChapters,
   fetchBook,
   fetchStats,
-  fetchSyncInfo,
-  isTocPlaceholder,
-  pullBookProgress,
-  pushBookProgressNow,
   updateBook,
   uploadCover,
 } from "@/api/admin";
-import type { SyncInfo, TocChapter } from "@/api/admin";
 import ScrapeDialog from "@/components/ScrapeDialog.vue";
+import BookTocPanel from "@/components/book-detail/BookTocPanel.vue";
+import BookSyncDialog from "@/components/book-detail/BookSyncDialog.vue";
 import AppIcon from "@/components/AppIcon.vue";
-import BaseEmpty from "@/components/BaseEmpty.vue";
 import type { AdminStats, BookDetail } from "@/api/types";
 
 const route = useRoute();
@@ -48,12 +43,8 @@ const coverFile = ref<File | null>(null);
 const scrapeOpen = ref(false);
 const pathExpanded = ref(false);
 
-// WebDAV 进度同步：详情页诊断 + 手动拉取/推送
+// WebDAV 进度同步弹窗
 const syncOpen = ref(false);
-const syncLoading = ref(false);
-const syncInfo = ref<SyncInfo | null>(null);
-const syncPulling = ref(false);
-const syncPushing = ref(false);
 
 const bookId = computed(() => {
   const raw = Array.isArray(route.params.id) ? route.params.id[0] : route.params.id;
@@ -94,116 +85,6 @@ const readLabel = computed(() => {
     .join(" · ");
 });
 
-/** 完整目录（下方栏） */
-const tocItems = ref<TocChapter[]>([]);
-const tocTotal = ref(0);
-const tocLoading = ref(false);
-
-/** 目录分页：每 200 章一段；'all' 为全部滚动 */
-const TOC_PAGE_SIZE = 200;
-const tocPage = ref<number | "all">("all");
-const tocFilter = ref("");
-
-/** 目录展示项：过滤伪占位行后附带 1 基顺序序号 */
-type TocDisplayItem = TocChapter & { no: number };
-
-const displayTocItems = computed<TocDisplayItem[]>(() => {
-  const bookName = form.title || book.value?.name;
-  const named = tocItems.value.filter((c) => !isTocPlaceholder(c.title, bookName));
-  return named.map((c, i) => ({ ...c, no: i + 1 }));
-});
-
-const filterActive = computed(() => tocFilter.value.trim().length > 0);
-
-/** 目录筛选结果：标题或章节序号 */
-const filteredTocItems = computed(() => {
-  const kw = tocFilter.value.trim().toLowerCase();
-  if (!kw) return displayTocItems.value;
-  return displayTocItems.value.filter(
-    (c) => c.title.toLowerCase().includes(kw) || String(c.no) === kw,
-  );
-});
-
-const tocPageRanges = computed(() => {
-  if (filterActive.value) return [];
-  const total = displayTocItems.value.length || tocTotal.value;
-  const pages: { key: number; label: string }[] = [];
-  if (total <= TOC_PAGE_SIZE) return pages;
-  for (let start = 1; start <= total; start += TOC_PAGE_SIZE) {
-    const end = Math.min(start + TOC_PAGE_SIZE - 1, total);
-    pages.push({ key: start, label: `${start}–${end}` });
-  }
-  return pages;
-});
-
-/** 页签条横向滚动（章节极多时避免铺满换行） */
-const tocPagesTrack = ref<HTMLElement | null>(null);
-const tocScrollLeft = ref(false);
-const tocScrollRight = ref(false);
-
-/** 页签较多时才显示左右按钮 */
-const showTocNav = computed(() => tocPageRanges.value.length > 3);
-
-function updateTocScrollState() {
-  const el = tocPagesTrack.value;
-  if (!el) {
-    tocScrollLeft.value = false;
-    tocScrollRight.value = false;
-    return;
-  }
-  const max = el.scrollWidth - el.clientWidth;
-  tocScrollLeft.value = el.scrollLeft > 1;
-  tocScrollRight.value = el.scrollLeft < max - 1;
-}
-
-function scrollTocPages(dir: -1 | 1) {
-  const el = tocPagesTrack.value;
-  if (!el) return;
-  el.scrollBy({ left: dir * Math.max(el.clientWidth * 0.6, 120), behavior: "smooth" });
-}
-
-function scrollTocIntoView() {
-  const el = tocPagesTrack.value;
-  if (!el) return;
-  const active = el.querySelector<HTMLElement>(".page-chip.is-active");
-  if (active) {
-    const left = active.offsetLeft - el.clientWidth / 2 + active.offsetWidth / 2;
-    el.scrollTo({ left: Math.max(0, left), behavior: "smooth" });
-  }
-  // 滚动动画结束后刷新按钮态
-  window.setTimeout(updateTocScrollState, 280);
-}
-
-watch(
-  tocPage,
-  () => {
-    nextTick(() => {
-      scrollTocIntoView();
-    });
-  },
-  { flush: "post" },
-);
-
-onMounted(() => {
-  nextTick(() => {
-    updateTocScrollState();
-  });
-  window.addEventListener("resize", updateTocScrollState);
-});
-
-onBeforeUnmount(() => {
-  window.removeEventListener("resize", updateTocScrollState);
-});
-
-const visibleTocItems = computed(() => {
-  if (filterActive.value) return filteredTocItems.value;
-  if (tocPage.value === "all") return displayTocItems.value;
-  const start = Number(tocPage.value);
-  const end = start + TOC_PAGE_SIZE - 1;
-  // 页签按过滤后的 1 基展示序号分页
-  return displayTocItems.value.filter((c) => c.no >= start && c.no <= end);
-});
-
 function applyBook(b: BookDetail) {
   book.value = b;
   form.title = b.name || "";
@@ -225,42 +106,16 @@ function applyBook(b: BookDetail) {
   }
 }
 
-async function loadToc() {
-  if (!bookId.value) return;
-  tocLoading.value = true;
-  try {
-    const { items, total } = await fetchAllBookChapters(bookId.value);
-    tocItems.value = items;
-    tocTotal.value = total || items.length || book.value?.chapter_count || 0;
-  } catch {
-    tocItems.value = (book.value?.chapters_preview || []).map((c) => ({
-      id: c.id,
-      index: c.index,
-      title: c.title,
-    }));
-    tocTotal.value = book.value?.chapter_count || tocItems.value.length;
-    // 页签条出现后刷新左右按钮可用态
-    nextTick(() => {
-      updateTocScrollState();
-      scrollTocIntoView();
-    });
-  } finally {
-    tocLoading.value = false;
-  }
-}
-
 async function load() {
   if (!bookId.value) {
     ElMessage.error("无效的书籍 ID");
     return;
   }
-  tocFilter.value = "";
   loading.value = true;
   try {
     const [detail, st] = await Promise.all([fetchBook(bookId.value), fetchStats()]);
     stats.value = st;
     applyBook(detail);
-    void loadToc();
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : "加载失败");
   } finally {
@@ -368,108 +223,6 @@ async function remove() {
   }
 }
 
-async function loadSyncInfo() {
-  if (!bookId.value) return;
-  syncLoading.value = true;
-  try {
-    syncInfo.value = await fetchSyncInfo(bookId.value);
-  } catch (e) {
-    syncInfo.value = null;
-    ElMessage.error(e instanceof Error ? e.message : "读取同步状态失败");
-  } finally {
-    syncLoading.value = false;
-  }
-}
-
-async function openSync() {
-  syncOpen.value = true;
-  await loadSyncInfo();
-}
-
-async function pullSync() {
-  if (!bookId.value || syncPulling.value) return;
-  syncPulling.value = true;
-  try {
-    const r = await pullBookProgress(bookId.value);
-    if (r.updated) {
-      ElMessage.success(`已拉取远端进度：第 ${(r.chapter_index ?? 0) + 1} 章`);
-      try {
-        // 只刷新书籍元信息，不覆盖表单里尚未保存的编辑
-        book.value = await fetchBook(bookId.value);
-      } catch {
-        /* ignore */
-      }
-    } else if (!r.enabled) {
-      ElMessage.warning("WebDAV 同步未启用");
-    } else if (r.error) {
-      ElMessage.error(r.error);
-    } else if (r.found) {
-      ElMessage.info(r.reason ? `未更新：${r.reason}` : "远端进度未更新");
-    } else {
-      ElMessage.info(`未找到远程文件：${r.filename || ""}`);
-    }
-    await loadSyncInfo();
-  } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : "拉取失败");
-  } finally {
-    syncPulling.value = false;
-  }
-}
-
-async function pushSync() {
-  if (!bookId.value || syncPushing.value) return;
-  syncPushing.value = true;
-  try {
-    const r = await pushBookProgressNow(bookId.value);
-    if (r.pushed) {
-      ElMessage.success("已推送本地进度到 WebDAV");
-    } else if (r.skipped === "remote_newer") {
-      ElMessage.warning("远端进度更新，已跳过本次推送");
-    } else {
-      ElMessage.error(r.error || "推送失败（本地可能还没有阅读进度）");
-    }
-    await loadSyncInfo();
-  } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : "推送失败");
-  } finally {
-    syncPushing.value = false;
-  }
-}
-
-/** 远程文件名解码后展示；复制时仍使用原始编码名 */
-function displayFilename(name?: string): string {
-  if (!name) return "—";
-  try {
-    return decodeURIComponent(name);
-  } catch {
-    return name;
-  }
-}
-
-async function copyFilename() {
-  const name = syncInfo.value?.filename;
-  if (!name) return;
-  try {
-    await navigator.clipboard.writeText(name);
-    ElMessage.success("原始文件名已复制");
-  } catch {
-    ElMessage.warning("复制失败");
-  }
-}
-
-function formatSyncTime(ms?: number): string {
-  if (!ms) return "—";
-  const d = new Date(ms);
-  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
-}
-
-function localProgressText(info: SyncInfo | null): string {
-  if (!info) return "—";
-  const idx = info.local.read_chapter_index;
-  const base = idx >= 0 ? `第 ${idx + 1} 章 · ${info.local.read_percent}%` : "未读";
-  return info.local.read_at ? `${base} · ${info.local.read_at}` : base;
-}
-
 function fmtWords(n?: number) {
   if (n === undefined || n === null) return "—";
   if (n >= 100000000) return (n / 100000000).toFixed(1) + " 亿";
@@ -480,16 +233,6 @@ function fmtWords(n?: number) {
 function openReader() {
   if (!bookId.value) return;
   router.push({ name: "book-read", params: { id: String(bookId.value) } });
-}
-
-/** 从目录进入阅读器并定位到该章 */
-function openReaderAt(ch: TocChapter) {
-  if (!bookId.value) return;
-  router.push({
-    name: "book-read",
-    params: { id: String(bookId.value) },
-    query: { chapter: String(ch.id) },
-  });
 }
 
 onMounted(load);
@@ -544,7 +287,7 @@ watch(bookId, () => void load());
             <AppIcon name="search" :size="14" />
             刮削元数据
           </button>
-          <button type="button" class="ghost-btn block" @click="openSync">
+          <button type="button" class="ghost-btn block" @click="syncOpen = true">
             <AppIcon name="api" :size="14" />
             进度同步
           </button>
@@ -640,87 +383,7 @@ watch(bookId, () => void load());
       </div>
 
       <!-- 下：目录（200 章分页 / 全部滚动） -->
-      <aside class="toc-side page-card">
-        <div class="toc-side-head">
-          <h2 class="section-title">目录</h2>
-          <div v-if="!filterActive" class="toc-pages">
-            <button
-              type="button"
-              class="page-chip"
-              :class="{ 'is-active': tocPage === 'all' }"
-              @click="tocPage = 'all'"
-            >
-              全部
-            </button>
-            <button
-              v-if="showTocNav"
-              type="button"
-              class="page-nav-btn"
-              :disabled="!tocScrollLeft"
-              title="向前翻页"
-              aria-label="向前翻页"
-              @click="scrollTocPages(-1)"
-            >
-              ‹
-            </button>
-            <div ref="tocPagesTrack" class="toc-pages-track" @scroll.passive="updateTocScrollState">
-              <button
-                v-for="p in tocPageRanges"
-                :key="p.key"
-                type="button"
-                class="page-chip"
-                :class="{ 'is-active': tocPage === p.key }"
-                @click="tocPage = p.key"
-              >
-                {{ p.label }}
-              </button>
-            </div>
-            <button
-              v-if="showTocNav"
-              type="button"
-              class="page-nav-btn"
-              :disabled="!tocScrollRight"
-              title="向后翻页"
-              aria-label="向后翻页"
-              @click="scrollTocPages(1)"
-            >
-              ›
-            </button>
-          </div>
-          <span class="muted-xs toc-count">共 {{ tocTotal || book?.chapter_count || 0 }} 章</span>
-        </div>
-        <div class="toc-filter">
-          <input v-model="tocFilter" class="toc-filter-input" placeholder="筛选章节…" />
-          <button
-            v-if="tocFilter"
-            type="button"
-            class="toc-clear"
-            title="清除筛选"
-            @click="tocFilter = ''"
-          >
-            ×
-          </button>
-          <span v-if="filterActive" class="muted-xs">{{ filteredTocItems.length }} 章</span>
-        </div>
-        <div v-loading="tocLoading" class="toc-side-list">
-          <button
-            v-for="ch in visibleTocItems"
-            :key="ch.id"
-            type="button"
-            class="toc-side-item"
-            @click="openReaderAt(ch)"
-          >
-            <span class="idx muted-xs">{{ ch.no }}</span>
-            <span class="ch-title">{{ ch.title }}</span>
-          </button>
-          <BaseEmpty
-            v-if="!visibleTocItems.length && !tocLoading"
-            compact
-            icon="list"
-            :title="filterActive ? '没有匹配章节' : '暂无章节'"
-          />
-        </div>
-      </aside>
+      <BookTocPanel :book-id="bookId" :book="book" />
     </div>
 
     <ScrapeDialog
@@ -732,68 +395,7 @@ watch(bookId, () => void load());
     />
 
     <!-- WebDAV 进度同步诊断与手动操作 -->
-    <el-dialog v-model="syncOpen" title="WebDAV 进度同步" width="560px" append-to-body>
-      <div v-loading="syncLoading" class="sync-panel">
-        <div class="sync-row">
-          <span class="sync-label">本地进度</span>
-          <span class="sync-value">{{ localProgressText(syncInfo) }}</span>
-        </div>
-        <div class="sync-row">
-          <span class="sync-label">远程文件名</span>
-          <span class="sync-value mono" :title="syncInfo?.filename || ''">
-            {{ displayFilename(syncInfo?.filename) }}
-          </span>
-          <button
-            v-if="syncInfo?.filename"
-            type="button"
-            class="link-btn sync-copy"
-            @click="copyFilename"
-          >
-            复制
-          </button>
-        </div>
-        <div class="sync-row">
-          <span class="sync-label">远端状态</span>
-          <span class="sync-value">
-            <template v-if="!syncInfo?.configured">未启用 WebDAV</template>
-            <template v-else-if="!syncInfo?.remote_exists">
-              文件不存在（Legado 尚未上传该书）
-            </template>
-            <template v-else-if="syncInfo?.remote">
-              第 {{ syncInfo.remote.durChapterIndex + 1 }} 章 ·
-              {{ syncInfo.remote.durChapterTitle || "—" }} ·
-              {{ formatSyncTime(syncInfo.remote.durChapterTime) }}
-            </template>
-            <template v-else>无法解析</template>
-          </span>
-        </div>
-        <div class="sync-row">
-          <span class="sync-label">匹配章节</span>
-          <span class="sync-value">
-            {{
-              syncInfo?.matched
-                ? `第 ${syncInfo.matched.index + 1} 章 · ${syncInfo.matched.title}`
-                : "—"
-            }}
-          </span>
-        </div>
-        <p v-if="syncInfo?.error" class="sync-error">{{ syncInfo.error }}</p>
-        <p class="muted-xs">
-          拉取按 durChapterTime 最新者优先，章节标题优先匹配；推送使用本地章节序号。
-        </p>
-        <div class="sync-actions">
-          <button type="button" class="ghost-btn" :disabled="syncLoading" @click="loadSyncInfo">
-            刷新
-          </button>
-          <button type="button" class="primary-btn" :disabled="syncPulling" @click="pullSync">
-            {{ syncPulling ? "拉取中…" : "拉取远端" }}
-          </button>
-          <button type="button" class="ghost-btn" :disabled="syncPushing" @click="pushSync">
-            {{ syncPushing ? "推送中…" : "推送本地" }}
-          </button>
-        </div>
-      </div>
-    </el-dialog>
+    <BookSyncDialog v-model:visible="syncOpen" :book-id="bookId" @pulled="book = $event" />
   </div>
 </template>
 
@@ -942,219 +544,6 @@ watch(bookId, () => void load());
     height: auto;
   }
 
-  .toc-side {
-    min-height: 240px;
-    overflow: hidden;
-  }
-}
-
-.toc-side {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  /* 目录吃满剩余高度，仅列表内滚动（页面无滚动条） */
-  flex: 1;
-  overflow: hidden;
-}
-
-.toc-side-head {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px 12px;
-  margin-bottom: 8px;
-}
-
-.toc-side-head .section-title {
-  margin: 0;
-}
-
-.toc-filter {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 0 0 8px;
-}
-
-.toc-filter-input {
-  flex: 1;
-  min-width: 0;
-  height: 30px;
-  padding: 0 8px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  background: var(--color-surface-2);
-  color: var(--color-text);
-  font-size: var(--text-xs);
-  font-family: inherit;
-  outline: none;
-}
-
-.toc-filter-input:focus {
-  border-color: var(--color-accent);
-  box-shadow: var(--shadow-focus);
-  background: var(--color-surface);
-}
-
-.toc-clear {
-  width: 22px;
-  height: 22px;
-  flex-shrink: 0;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--color-text-3);
-  font-size: 16px;
-  line-height: 1;
-  cursor: pointer;
-}
-
-.toc-clear:hover {
-  background: var(--color-surface-2);
-  color: var(--color-text);
-}
-
-.toc-pages {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: 1;
-  min-width: 0;
-}
-
-.toc-pages-track {
-  display: flex;
-  flex-wrap: nowrap;
-  gap: 6px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  min-width: 0;
-  flex: 1;
-  padding: 2px 0;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-  scroll-behavior: smooth;
-}
-
-.toc-pages-track::-webkit-scrollbar {
-  display: none;
-}
-
-.page-chip {
-  border: 1px solid var(--color-border);
-  background: var(--color-surface);
-  color: var(--color-text-2);
-  font-size: var(--text-xs);
-  padding: 3px 10px;
-  border-radius: var(--radius-full);
-  cursor: pointer;
-  font-family: inherit;
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-
-.page-nav-btn {
-  flex-shrink: 0;
-  width: 24px;
-  height: 24px;
-  border: 1px solid var(--color-border);
-  background: var(--color-surface);
-  color: var(--color-text-2);
-  border-radius: var(--radius-full);
-  cursor: pointer;
-  font-size: 14px;
-  line-height: 1;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-family: inherit;
-  padding: 0;
-}
-
-.page-nav-btn:hover:not(:disabled) {
-  border-color: var(--color-border-strong);
-  color: var(--color-text);
-}
-
-.page-nav-btn:disabled {
-  opacity: 0.35;
-  cursor: default;
-}
-
-.page-chip:hover {
-  border-color: var(--color-border-strong);
-  color: var(--color-text);
-}
-
-.page-chip.is-active {
-  background: var(--color-accent-soft);
-  border-color: var(--color-accent);
-  color: var(--color-accent);
-}
-
-.toc-count {
-  flex-shrink: 0;
-}
-
-.toc-side-list {
-  overflow-y: auto;
-  overflow-x: hidden;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-height: 0;
-  flex: 1;
-  /* 细滚动条，长目录可滚 */
-  scrollbar-width: thin;
-  scrollbar-color: var(--color-border-strong) transparent;
-  padding-right: 4px;
-}
-
-.toc-side-list::-webkit-scrollbar {
-  width: 6px;
-}
-
-.toc-side-list::-webkit-scrollbar-thumb {
-  background: var(--color-border-strong);
-  border-radius: 3px;
-}
-
-.toc-side-list::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.toc-side-item {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  width: 100%;
-  text-align: left;
-  border: none;
-  background: transparent;
-  padding: 6px 8px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  font: inherit;
-  color: var(--color-text);
-}
-
-.toc-side-item:hover {
-  background: var(--color-surface-2);
-  color: var(--color-accent);
-}
-
-.toc-side-item .idx {
-  flex-shrink: 0;
-  min-width: 2.2em;
-  text-align: right;
-}
-
-.toc-side-item .ch-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--text-sm);
 }
 
 .cover-side {
@@ -1435,87 +824,4 @@ watch(bookId, () => void load());
   height: 24px;
 }
 
-.chapter-list {
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  max-height: 240px;
-  overflow: auto;
-}
-
-.chapter-row {
-  display: flex;
-  gap: 10px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--color-border);
-  font-size: var(--text-sm);
-}
-
-.chapter-row:last-child {
-  border-bottom: none;
-}
-
-.chapter-row:hover {
-  background: var(--color-surface-2);
-}
-
-.idx {
-  width: 32px;
-  flex-shrink: 0;
-  font-variant-numeric: tabular-nums;
-}
-
-.ch-title {
-  color: var(--color-text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* ---- WebDAV 进度同步弹窗 ---- */
-.sync-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  min-height: 120px;
-}
-
-.sync-row {
-  display: flex;
-  gap: 12px;
-  font-size: var(--text-sm);
-}
-
-.sync-label {
-  width: 84px;
-  flex-shrink: 0;
-  color: var(--color-text-3);
-}
-
-.sync-value {
-  color: var(--color-text);
-  word-break: break-all;
-}
-
-.sync-value.mono {
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: var(--text-xs);
-}
-
-.sync-copy {
-  flex-shrink: 0;
-  margin-left: auto;
-}
-
-.sync-error {
-  margin: 0;
-  color: var(--color-danger);
-  font-size: var(--text-xs);
-}
-
-.sync-actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-top: 4px;
-}
 </style>

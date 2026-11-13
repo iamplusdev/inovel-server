@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 from ..auth import require_read_dep
 from ..database import get_db
 from ..models import Book, Chapter
+from ..online_reader import OnlineReadError, ensure_chapter_content, ensure_toc
+from ..online_search import is_online_book
 from ..serializers import resolve_base_url
 
 router = APIRouter(
@@ -154,6 +156,11 @@ def legado_toc(request: Request, book_id: int, db: Session = Depends(get_db)) ->
     book = db.get(Book, book_id)
     if not book:
         raise HTTPException(404, "书籍不存在")
+    if is_online_book(book):
+        try:
+            ensure_toc(db, book)
+        except OnlineReadError as exc:
+            raise HTTPException(502, str(exc)) from exc
     # 目录只取标题列，避免整本正文进内存
     chapters = db.execute(
         select(Chapter.id, Chapter.index, Chapter.title)
@@ -185,6 +192,13 @@ def legado_content(
     ch = db.get(Chapter, chapter_id)
     if not ch or ch.book_id != book_id:
         raise HTTPException(404, "章节不存在")
+    book = db.get(Book, book_id)
+    if book is not None and is_online_book(book) and not (ch.content or ""):
+        if int(ch.content_length or 0) <= 0:
+            try:
+                ensure_chapter_content(db, book, ch)
+            except OnlineReadError as exc:
+                raise HTTPException(502, str(exc)) from exc
     # 正文走正文包偏移读取
     from ..content_store import read_chapter_text
 

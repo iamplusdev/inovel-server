@@ -3,7 +3,7 @@
  * 设置：主题、改密（页内表单）、运行环境。
  * 退出登录仅在侧栏入口，不在本页展示。
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage } from "element-plus";
 import { useAuthStore } from "@/stores/auth";
 import { useThemeStore, type ThemeMode } from "@/stores/theme";
@@ -229,15 +229,99 @@ onMounted(async () => {
     /* ignore */
   }
 });
+
+// —— 分区锚点：吸顶导航 + 滚动高亮 ——
+const SECTIONS = [
+  { id: "appearance", label: "外观" },
+  { id: "account", label: "账号" },
+  { id: "scrape", label: "刮削参数" },
+  { id: "maintenance", label: "自动体检" },
+  { id: "sync", label: "进度同步" },
+  { id: "env", label: "运行环境" },
+] as const;
+
+const pageRef = ref<HTMLElement | null>(null);
+const activeSection = ref<string>(SECTIONS[0].id);
+let scrollRoot: HTMLElement | null = null;
+let scrollRaf = 0;
+
+function sectionEl(id: string) {
+  return document.getElementById(`settings-${id}`);
+}
+
+/** 以导航底边为界，取最后一个越过界线的分区；滚到底时固定在末项 */
+function updateActiveSection() {
+  scrollRaf = 0;
+  const rootTop = scrollRoot?.getBoundingClientRect().top ?? 0;
+  const threshold = rootTop + 64;
+  let current: string = SECTIONS[0].id;
+  for (const s of SECTIONS) {
+    const el = sectionEl(s.id);
+    if (!el) continue;
+    if (el.getBoundingClientRect().top <= threshold) current = s.id;
+    else break;
+  }
+  if (
+    scrollRoot &&
+    scrollRoot.scrollHeight - scrollRoot.scrollTop - scrollRoot.clientHeight < 8
+  ) {
+    current = SECTIONS[SECTIONS.length - 1].id;
+  }
+  activeSection.value = current;
+}
+
+function onPageScroll() {
+  if (!scrollRaf) scrollRaf = requestAnimationFrame(updateActiveSection);
+}
+
+function onSectionClick(id: string) {
+  activeSection.value = id;
+  sectionEl(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  // 仅同步地址栏，不触发路由跳转；刷新/分享可直达分区
+  if (location.hash !== `#${id}`) history.replaceState(null, "", `#${id}`);
+}
+
+onMounted(() => {
+  scrollRoot = (pageRef.value?.closest(".main") as HTMLElement | null) ?? null;
+  scrollRoot?.addEventListener("scroll", onPageScroll, { passive: true });
+  const hash = location.hash.replace(/^#/, "");
+  if (SECTIONS.some((s) => s.id === hash)) {
+    activeSection.value = hash;
+    nextTick(() => sectionEl(hash)?.scrollIntoView({ block: "start" }));
+    // 设置项是异步加载的，上方内容变高后再校正一次落点
+    window.setTimeout(() => sectionEl(hash)?.scrollIntoView({ block: "start" }), 350);
+  } else {
+    nextTick(updateActiveSection);
+  }
+});
+
+onBeforeUnmount(() => {
+  scrollRoot?.removeEventListener("scroll", onPageScroll);
+  if (scrollRaf) cancelAnimationFrame(scrollRaf);
+});
 </script>
 
 <template>
-  <div class="page settings-page">
+  <div ref="pageRef" class="page settings-page">
     <header class="page-header">
       <h1 class="page-title">设置</h1>
     </header>
 
-    <section class="page-card">
+    <nav class="settings-nav" aria-label="设置分区">
+      <button
+        v-for="s in SECTIONS"
+        :key="s.id"
+        type="button"
+        class="settings-nav-item"
+        :class="{ 'is-active': activeSection === s.id }"
+        :aria-current="activeSection === s.id ? 'true' : undefined"
+        @click="onSectionClick(s.id)"
+      >
+        {{ s.label }}
+      </button>
+    </nav>
+
+    <section id="settings-appearance" class="page-card settings-section">
       <div class="section-head">
         <AppIcon name="palette" :size="16" />
         <h2 class="section-title">外观</h2>
@@ -260,7 +344,7 @@ onMounted(async () => {
       </div>
     </section>
 
-    <section class="page-card">
+    <section id="settings-account" class="page-card settings-section">
       <div class="section-head">
         <AppIcon name="settings" :size="16" />
         <h2 class="section-title">账号</h2>
@@ -301,7 +385,7 @@ onMounted(async () => {
       </form>
     </section>
 
-    <section class="page-card">
+    <section id="settings-scrape" class="page-card settings-section">
       <div class="section-head">
         <AppIcon name="settings" :size="16" />
         <h2 class="section-title">刮削参数</h2>
@@ -343,7 +427,7 @@ onMounted(async () => {
       </button>
     </section>
 
-    <section class="page-card">
+    <section id="settings-maintenance" class="page-card settings-section">
       <div class="section-head">
         <AppIcon name="check" :size="16" />
         <h2 class="section-title">自动体检</h2>
@@ -389,10 +473,10 @@ onMounted(async () => {
       </button>
     </section>
 
-    <section class="page-card">
+    <section id="settings-sync" class="page-card settings-section">
       <div class="section-head">
         <AppIcon name="api" :size="16" />
-        <h2 class="section-title">WebDAV 进度同步</h2>
+        <h2 class="section-title">阅读进度同步（WebDAV）</h2>
       </div>
       <p class="muted">
         与 Legado 共用同一个 WebDAV 的 <code>bookProgress</code> 目录：打开阅读页拉取最新进度，关闭页面时推送。
@@ -467,7 +551,7 @@ onMounted(async () => {
       </p>
     </section>
 
-    <section class="page-card">
+    <section id="settings-env" class="page-card settings-section">
       <div class="section-head">
         <AppIcon name="api" :size="16" />
         <h2 class="section-title">运行环境</h2>
@@ -489,6 +573,71 @@ onMounted(async () => {
 .section-head .section-title {
   margin: 0;
   color: var(--color-text);
+}
+
+/* 分区导航：吸顶，点击滚动到对应卡片。
+   主内容区有上内边距，用负 top 让导航贴住滚动区顶部，避免内容从缝隙里透出 */
+.settings-nav {
+  position: sticky;
+  top: calc(-1 * var(--space-5));
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 5px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.settings-nav-item {
+  padding: 6px 14px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-2);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition:
+    background var(--duration) ease,
+    color var(--duration) ease;
+}
+
+.settings-nav-item:hover {
+  background: var(--color-surface-2);
+  color: var(--color-text);
+}
+
+.settings-nav-item.is-active {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+/* 锚点定位时给吸顶导航留出高度 */
+.settings-section {
+  scroll-margin-top: 64px;
+}
+
+@media (max-width: 900px) {
+  .settings-nav {
+    top: calc(-1 * var(--space-4));
+  }
+}
+
+@media (max-width: 576px) {
+  .settings-nav {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 5px;
+    top: calc(-1 * var(--space-3));
+  }
+
+  .settings-nav-item {
+    flex: 0 0 auto;
+  }
 }
 
 .theme-row {

@@ -1613,7 +1613,7 @@ class CoreTests(unittest.TestCase):
 
 
     def test_webdav_list_files_decodes_href(self) -> None:
-        """PROPFIND Depth:1 响应里的中文文件名需要 URL 解码后匹配书库。"""
+        """PROPFIND Depth:1 响应里的中文文件名需要 URL 解码；同时带出修改时间。"""
         from unittest import mock
 
         from app.webdav import WebDavClient
@@ -1621,16 +1621,25 @@ class CoreTests(unittest.TestCase):
         xml = (
             '<?xml version="1.0"?>'
             '<d:multistatus xmlns:d="DAV:">'
-            "<d:response><d:href>/dav/legado/bookProgress/</d:href></d:response>"
+            "<d:response><d:href>/dav/legado/bookProgress/</d:href>"
+            "<d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>"
+            "</d:propstat></d:response>"
             "<d:response><d:href>/dav/legado/bookProgress/"
-            "%E6%B5%8B%E8%AF%95%E4%B9%A6_%E4%BD%9C%E8%80%85.json</d:href></d:response>"
-            "<d:response><d:href>/dav/legado/bookProgress/readme.txt</d:href></d:response>"
+            "%E6%B5%8B%E8%AF%95%E4%B9%A6_%E4%BD%9C%E8%80%85.json</d:href>"
+            "<d:propstat><d:prop><d:resourcetype/>"
+            "<d:getlastmodified>Wed, 21 Oct 2015 07:28:00 GMT</d:getlastmodified>"
+            "</d:prop></d:propstat></d:response>"
+            "<d:response><d:href>/dav/legado/bookProgress/readme.txt</d:href>"
+            "<d:propstat><d:prop><d:resourcetype/></d:prop></d:propstat></d:response>"
             "</d:multistatus>"
         ).encode("utf-8")
         client = WebDavClient(base_url="https://dav.example.com/dav")
         with mock.patch.object(client, "_request", return_value=(207, xml)):
-            names = client.list_files("https://dav.example.com/dav/legado/bookProgress/")
-        self.assertEqual(names, ["测试书_作者.json"])
+            files = client.list_files("https://dav.example.com/dav/legado/bookProgress/")
+        self.assertEqual(
+            files,
+            [{"name": "测试书_作者.json", "modified": "Wed, 21 Oct 2015 07:28:00 GMT"}],
+        )
 
     def test_sync_pull_all_updates_books_including_never_read(self) -> None:
         """批量同步：手机 Legado 写过的书（含服务端从未读过的）进度写回 DB。"""
@@ -1675,7 +1684,7 @@ class CoreTests(unittest.TestCase):
 
         class FakeClient:
             def list_files(self, url):
-                return [f"{name}_作者.json" for name in remotes]
+                return [{"name": f"{name}_作者.json", "modified": ""} for name in remotes]
 
             def get(self, url):
                 decoded = unquote(url.rsplit("/", 1)[-1])
@@ -1744,7 +1753,7 @@ class CoreTests(unittest.TestCase):
                 self.gets: list[str] = []
 
             def list_files(self, url):
-                return matching + outside
+                return [{"name": n, "modified": ""} for n in matching + outside]
 
             def get(self, url):
                 decoded = unquote(url.rsplit("/", 1)[-1])
@@ -1792,6 +1801,153 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(db.get(Book, bid).read_chapter_index, 1)
         db.close()
 
+    def test_sync_pull_all_skips_unchanged_files_by_mtime(self) -> None:
+        """远端文件 mtime 明显旧于本地进度时不再 GET；只有远端更新的书才拉取。"""
+        import json
+        import time
+        from unittest import mock
+        from urllib.parse import unquote
+
+        from app import sync_progress
+        from app.models import Book, Chapter
+
+        s = self.db.SessionLocal()
+        stale = Book(
+            title="未更新的书", author="作者", category="都市", chapter_count=2,
+            read_chapter_index=1, read_percent=100, read_at="2026-11-10T12:00:00",
+        )
+        fresh = Book(title="手机新读", author="作者", category="都市", chapter_count=2)
+        s.add_all([stale, fresh])
+        s.flush()
+        for b in (stale, fresh):
+            s.add_all(
+                [
+                    Chapter(book_id=b.id, index=0, title="第一章", content="a"),
+                    Chapter(book_id=b.id, index=1, title="第二章", content="b"),
+                ]
+            )
+        s.commit()
+        fresh_id = fresh.id
+        s.close()
+
+        remote_ms = int(time.time() * 1000) + 1000
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.gets: list[str] = []
+
+            def list_files(self, url):
+                return [
+                    # 远端文件比本地 read_at 旧几个月 ⇒ 必然没有新进度
+                    {"name": "未更新的书_作者.json", "modified": "Tue, 05 May 2026 00:00:00 GMT"},
+                    {"name": "手机新读_作者.json", "modified": "Tue, 10 Nov 2026 00:00:00 GMT"},
+                ]
+
+            def get(self, url):
+                name = unquote(url.rsplit("/", 1)[-1])
+                self.gets.append(name)
+                return json.dumps(
+                    {
+                        "name": "手机新读", "author": "作者", "durChapterIndex": 1,
+                        "durChapterPos": 5, "durChapterTime": remote_ms,
+                        "durChapterTitle": "第二章",
+                    }
+                ).encode()
+
+        settings = {
+            "enabled": True, "url": "https://dav.example.com/dav",
+            "username": "u", "password": "p", "dir": "legado",
+            "timeout": 6, "verify_tls": True,
+        }
+        fake = FakeClient()
+        with mock.patch.object(
+            sync_progress.webdav_settings, "load", return_value=settings
+        ), mock.patch.object(sync_progress, "_client", return_value=fake):
+            db = self.db.SessionLocal()
+            result = sync_progress.pull_all(db)
+            db.close()
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["scanned"], 1)
+        self.assertEqual(result["updated"], 1)
+        # 只为远端更新过的那本书发出 GET
+        self.assertEqual(fake.gets, ["手机新读_作者.json"])
+        db = self.db.SessionLocal()
+        self.assertEqual(db.get(Book, fresh_id).read_chapter_index, 1)
+        db.close()
+
+    def test_sync_pull_all_fetches_concurrently(self) -> None:
+        """需要拉取的进度文件应并行请求，而不是逐本串行等待。"""
+        import json
+        import threading
+        import time
+        from unittest import mock
+        from urllib.parse import unquote
+
+        from app import sync_progress
+        from app.models import Book, Chapter
+
+        titles = [f"并发书{i}" for i in range(4)]
+        s = self.db.SessionLocal()
+        for title in titles:
+            book = Book(title=title, author="作者", category="都市", chapter_count=2)
+            s.add(book)
+            s.flush()
+            s.add_all(
+                [
+                    Chapter(book_id=book.id, index=0, title="第一章", content="a"),
+                    Chapter(book_id=book.id, index=1, title="第二章", content="b"),
+                ]
+            )
+        s.commit()
+        s.close()
+
+        remote_ms = int(time.time() * 1000) + 1000
+        lock = threading.Lock()
+        state = {"current": 0, "max": 0}
+
+        class FakeClient:
+            def list_files(self, url):
+                return [{"name": f"{t}_作者.json", "modified": ""} for t in titles]
+
+            def get(self, url):
+                with lock:
+                    state["current"] += 1
+                    state["max"] = max(state["max"], state["current"])
+                try:
+                    time.sleep(0.2)  # 模拟网络往返；串行 4 次至少 0.8s
+                    title = unquote(url.rsplit("/", 1)[-1]).split("_")[0]
+                    return json.dumps(
+                        {
+                            "name": title, "author": "作者", "durChapterIndex": 1,
+                            "durChapterPos": 5, "durChapterTime": remote_ms,
+                            "durChapterTitle": "第二章",
+                        }
+                    ).encode()
+                finally:
+                    with lock:
+                        state["current"] -= 1
+
+        settings = {
+            "enabled": True, "url": "https://dav.example.com/dav",
+            "username": "u", "password": "p", "dir": "legado",
+            "timeout": 6, "verify_tls": True,
+        }
+        with mock.patch.object(
+            sync_progress.webdav_settings, "load", return_value=settings
+        ), mock.patch.object(sync_progress, "_client", return_value=FakeClient()):
+            db = self.db.SessionLocal()
+            started = time.monotonic()
+            result = sync_progress.pull_all(db)
+            elapsed = time.monotonic() - started
+            db.close()
+
+        self.assertEqual(result["scanned"], 4)
+        self.assertEqual(result["updated"], 4)
+        self.assertGreaterEqual(state["max"], 2, "GET 应并发执行")
+        self.assertLess(elapsed, 0.7, f"并发拉取耗时 {elapsed:.2f}s，疑似退化为串行")
+
     def test_sync_pull_all_endpoint(self) -> None:
         """POST /api/admin/sync/pull-all 端点：鉴权挂载 + 写回 DB + 响应结构。"""
         import json
@@ -1828,7 +1984,7 @@ class CoreTests(unittest.TestCase):
 
         class FakeClient:
             def list_files(self, url):
-                return ["手机端书_作者.json"]
+                return [{"name": "手机端书_作者.json", "modified": ""}]
 
             def get(self, url):
                 if unquote(url.rsplit("/", 1)[-1]).startswith("手机端书_作者"):
@@ -1854,6 +2010,9 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(data["enabled"])
         self.assertEqual(data["updated"], 1)
         self.assertEqual(data["books"][0]["book_id"], bid)
+        # 卡片增量渲染所需字段：读到第 2/2 章 ⇒ 100%，并带阅读时间
+        self.assertEqual(data["books"][0]["read_percent"], 100)
+        self.assertTrue(data["books"][0]["read_at"])
         db = self.db.SessionLocal()
         self.assertEqual(db.get(Book, bid).read_chapter_index, 1)
         db.close()

@@ -10,23 +10,19 @@ import {
   fetchAllBookChapters,
   fetchBook,
   fetchChapterContent,
-  pullBookProgress,
-  searchBookContent,
-  updateReadProgress,
 } from "@/api/admin";
 import ReaderHelpPanel from "@/components/reader/ReaderHelpPanel.vue";
 import ReaderSearchPanel from "@/components/reader/ReaderSearchPanel.vue";
 import ReaderSettingsPanel from "@/components/reader/ReaderSettingsPanel.vue";
+import ReaderSourcePanel from "@/components/reader/ReaderSourcePanel.vue";
 import ReaderTocSidebar from "@/components/reader/ReaderTocSidebar.vue";
 import ReaderTopBar from "@/components/reader/ReaderTopBar.vue";
-import { FONT_STACKS } from "@/views/reader/constants";
-import type {
-  ReaderFont,
-  ReaderSyncState,
-  ReaderTheme,
-} from "@/views/reader/constants";
+import { useReaderPaging } from "@/views/reader/useReaderPaging";
+import { useReaderPreferences } from "@/views/reader/useReaderPreferences";
+import { useReaderProgress } from "@/views/reader/useReaderProgress";
+import { useReaderSearch } from "@/views/reader/useReaderSearch";
+import { useReaderSources } from "@/views/reader/useReaderSources";
 import { highlightParts } from "@/utils/highlight";
-import type { BookSearchHit, PullProgressResult } from "@/api/admin";
 import type { BookDetail } from "@/api/types";
 
 interface TocItem {
@@ -38,11 +34,18 @@ interface TocItem {
 const route = useRoute();
 const router = useRouter();
 
+const bookId = computed(() => {
+  const raw = Array.isArray(route.params.id) ? route.params.id[0] : route.params.id;
+  const n = Number.parseInt(String(raw ?? ""), 10);
+  return Number.isInteger(n) && n > 0 ? n : 0;
+});
+
 const book = ref<BookDetail | null>(null);
 const loading = ref(false);
 const contentLoading = ref(false);
 const chapterText = ref("");
 const chapterError = ref("");
+const activeChapterId = ref<number | null>(null);
 
 /** 正文段落及其在原文中的起始偏移（搜索/远端位置跳转用） */
 const chapterParagraphs = computed(() => {
@@ -57,19 +60,39 @@ const chapterParagraphs = computed(() => {
 });
 const tocItems = ref<TocItem[]>([]);
 const tocTotal = ref(0);
+/** 在线书目录同步失败时的提示（书源不可达/规则不支持等） */
+const tocError = ref("");
 /** 目录侧栏开合（记忆到 localStorage） */
 const tocOpen = ref(localStorage.getItem("novel_read_toc") !== "0");
 const settingsOpen = ref(false);
 
-/** 书内搜索面板 */
-const searchOpen = ref(false);
-const searchQuery = ref("");
-const searchLoading = ref(false);
-const searchError = ref("");
-const searchHits = ref<BookSearchHit[]>([]);
-const searchTotal = ref(0);
-/** 搜索请求序号：快速连续搜索时丢弃过期响应 */
-let searchSeq = 0;
+/** 切换书源面板（仅在线书） */
+const isOnlineBook = computed(() => !!book.value?.online);
+
+const {
+  sourceOpen,
+  sourceLoading,
+  sourceError,
+  sourceHint,
+  sourceItems,
+  sourceCurrentName,
+  switchingSource,
+  toggleSources,
+  loadSources,
+  applySource,
+  resetSources,
+} = useReaderSources({
+  bookId,
+  book,
+  isOnlineBook,
+  chapterText,
+  chapterError,
+  activeChapterId,
+  persistProgress: () => persistProgress(),
+  reload: () => load(),
+  revealTopbar,
+  closeOtherPanels,
+});
 
 /** 沉浸模式：阅读时自动收起顶栏 */
 const autoHideTopbar = ref(localStorage.getItem("novel_read_autohide") !== "0");
@@ -81,83 +104,106 @@ let lastScrollTop = 0;
 /** 窄屏：目录以覆盖抽屉展示 */
 const isNarrow = ref(window.innerWidth < 900);
 const isFullscreen = ref(false);
-const activeChapterId = ref<number | null>(null);
-
-const fontSize = ref(Number(localStorage.getItem("novel_read_font") || 18));
-const lineHeight = ref(Number(localStorage.getItem("novel_read_leading") || 1.8));
-const readerTheme = ref<ReaderTheme>(
-  (localStorage.getItem("novel_read_theme") as ReaderTheme) || "paper",
-);
-/** 正文字体：宋体 / 黑体 / 系统 */
-const readerFont = ref<ReaderFont>((() => {
-  const saved = localStorage.getItem("novel_read_font_family") as ReaderFont | null;
-  return saved && saved in FONT_STACKS ? saved : "serif";
-})());
-/** 正文最大宽度（px），窄屏由容器自动收缩 */
-const contentWidth = ref((() => {
-  const n = Number(localStorage.getItem("novel_read_width") || 720);
-  return Number.isFinite(n) ? Math.min(1000, Math.max(560, n)) : 720;
-})());
 
 /** 阅读模式：上下滚动（默认）/ 左右翻页 */
 const pagedMode = ref(localStorage.getItem("novel_read_mode") === "paged");
-/** 翻页：栏间距、当前页宽、总页数、当前页序号 */
-const PAGE_GAP = 48;
-const pageWidth = ref(720);
-const pageCount = ref(1);
-const pageIndex = ref(0);
-/** 向上跨章时指定要落到最后一页的章节 id（避免标记串到其它章节） */
-let pendingLastPageFor: number | null = null;
+
+const {
+  fontSize,
+  lineHeight,
+  readerTheme,
+  readerFont,
+  contentWidth,
+  readerStyle,
+  articleStyle,
+  themeClass,
+  persistPrefs,
+  changeFont,
+} = useReaderPreferences({ pagedMode, tocOpen, autoHideTopbar });
+
 const trackEl = ref<HTMLElement | null>(null);
 const articleEl = ref<HTMLElement | null>(null);
+const contentEl = ref<HTMLElement | null>(null);
 
-/** 远端进度带来的章内字符位置（绑定目标章节，只消费一次） */
-const pendingRemotePos = ref<{ chapterId: number; pos: number } | null>(null);
-/** 搜索命中跳转：目标章节 + 字内偏移 + 关键词（用于高亮） */
-const pendingSearchJump = ref<{ chapterId: number; offset: number; query: string } | null>(null);
-const activeHighlightQuery = ref("");
-/** Beacon 推送节流：pagehide 与 visibilitychange 可能连续触发 */
-let lastBeaconAt = 0;
+const {
+  pageCount,
+  pageIndex,
+  pendingLastPageFor,
+  pagedHint,
+  pagedArticleStyle,
+  pagedVars,
+  maybeShowPagedHint,
+  dismissPagedHint,
+  relayoutPaged,
+  nextPage,
+  prevPage,
+  scheduleResizeRelayout,
+  resetPaging,
+  disposePaging,
+} = useReaderPaging({
+  pagedMode,
+  chapterText,
+  activeChapterId,
+  fontSize,
+  lineHeight,
+  contentWidth,
+  readerFont,
+  tocOpen,
+  settingsOpen,
+  trackEl,
+  articleEl,
+  chapters: () => chapters.value,
+  chapterNo: () => chapterNo.value,
+  hasNext: () => hasNext.value,
+  rememberPage: (id, page) => rememberPage(id, page),
+  goChapter: (id) => goChapter(id),
+  goNextChapter: () => goNextChapter(),
+  scheduleTopbarHide: () => scheduleTopbarHide(),
+});
+
+/** 程序化滚动（切章恢复位置）不参与顶栏显示/隐藏判断 */
+function scrollToTop(top: number) {
+  if (!contentEl.value) return;
+  scrollSuppressed = true;
+  contentEl.value.scrollTo({ top, behavior: "auto" });
+  lastScrollTop = top;
+  requestAnimationFrame(() => {
+    scrollSuppressed = false;
+  });
+}
+
+const {
+  searchOpen,
+  searchQuery,
+  searchLoading,
+  searchError,
+  searchHits,
+  searchTotal,
+  pendingSearchJump,
+  activeHighlightQuery,
+  runSearch,
+  openSearchResult,
+  resetSearch,
+} = useReaderSearch({
+  bookId,
+  activeChapterId,
+  chapterText,
+  contentEl,
+  pagedMode,
+  pageCount,
+  pageIndex,
+  relayoutPaged: () => relayoutPaged(),
+  scrollTopForChar: (pos) => scrollTopForChar(pos),
+  scrollToTop,
+  goChapter: (id) => goChapter(id),
+});
+
+/** 远端进度与 Beacon 节流由 useReaderProgress 维护 */
 
 /** 快捷键帮助浮层 */
 const helpOpen = ref(false);
 /** 当前章内滚动比例（0–1），用于整体进度条 */
 const scrollFraction = ref(0);
-
-/** WebDAV 同步状态：超时不再阻塞阅读，晚到的远端进度给出手动入口 */
-const syncState = ref<ReaderSyncState>("idle");
-const lateRemote = ref<PullProgressResult | null>(null);
-let syncStateTimer: ReturnType<typeof setTimeout> | undefined;
-
-function setSyncState(state: ReaderSyncState) {
-  syncState.value = state;
-  clearTimeout(syncStateTimer);
-  if (state === "synced" || state === "failed") {
-    syncStateTimer = setTimeout(() => {
-      if (syncState.value === state) syncState.value = "idle";
-    }, 4000);
-  }
-}
-
-/** 首次进入翻页模式的交互提示（只提示一次） */
-const pagedHint = ref(false);
-let pagedHintTimer: ReturnType<typeof setTimeout> | undefined;
-
-function maybeShowPagedHint() {
-  if (localStorage.getItem("novel_read_paged_hint") === "1") return;
-  localStorage.setItem("novel_read_paged_hint", "1");
-  pagedHint.value = true;
-  clearTimeout(pagedHintTimer);
-  pagedHintTimer = setTimeout(() => {
-    pagedHint.value = false;
-  }, 6000);
-}
-
-const bookId = computed(() => {
-  const raw = Array.isArray(route.params.id) ? route.params.id[0] : route.params.id;
-  const n = Number.parseInt(String(raw ?? ""), 10);
-  return Number.isInteger(n) && n > 0 ? n : 0;
-});
 
 const chapters = computed(() => tocItems.value);
 /** 目录筛选关键词（标题或章节号） */
@@ -185,18 +231,39 @@ const chapterTotal = computed(() => {
   return Math.max(fromBook, fromToc, chapters.value.length, 0);
 });
 
-/** 顶栏进度文案：第 n / 总 · x%（翻页模式附带页码） */
-const progressText = computed(() => {
-  const total = chapterTotal.value;
-  const n = chapterNo.value;
-  if (!total || !n) return "";
-  const pageInfo =
-    pagedMode.value && pageCount.value > 1 ? ` · ${pageIndex.value + 1}/${pageCount.value} 页` : "";
-  return `第 ${n} / ${total} 章 · ${overallPercent.value}%${pageInfo}`;
-});
-
 const hasPrev = computed(() => chapterNo.value > 1);
 const hasNext = computed(() => chapterNo.value > 0 && chapterNo.value < chapterTotal.value);
+
+const {
+  syncState,
+  pendingRemotePos,
+  setSyncState,
+  overallPercent,
+  progressText,
+  persistProgress,
+  startPull,
+  awaitPull,
+  applyLateRemote,
+  pushProgressBeacon,
+  onVisibilityChange,
+  resetSync,
+  disposeSync,
+} = useReaderProgress({
+  bookId,
+  book,
+  activeChapterId,
+  chapterText,
+  contentEl,
+  pagedMode,
+  pageIndex,
+  pageCount,
+  scrollFraction,
+  chapterNo,
+  chapterTotal,
+  chapters,
+  activeChapter,
+  loadChapterContent: (id) => loadChapterContent(id),
+});
 
 /** 正文请求序号：快速切章时丢弃过期响应，避免旧章节覆盖新章节 */
 let contentSeq = 0;
@@ -366,30 +433,6 @@ async function prefetchNextChapter() {
   }
 }
 
-/** 测量翻页模式的总页数（横向多栏宽度） */
-function measurePaged() {
-  const art = articleEl.value;
-  if (!pagedMode.value || !art) return;
-  const width = pageWidth.value;
-  if (width <= 0) return;
-  const total = Math.max(1, Math.ceil((art.scrollWidth + PAGE_GAP) / (width + PAGE_GAP)));
-  pageCount.value = total;
-  if (pageIndex.value > total - 1) pageIndex.value = Math.max(0, total - 1);
-}
-
-/** 重新计算页宽与页数（切模式/改字号/改宽度/窗口变化时调用） */
-async function relayoutPaged() {
-  if (!pagedMode.value || !chapterText.value) return;
-  await nextTick();
-  const w = trackEl.value?.clientWidth || 0;
-  if (w > 0 && w !== pageWidth.value) pageWidth.value = w;
-  await nextTick();
-  await new Promise<void>((resolve) => {
-    requestAnimationFrame(() => resolve());
-  });
-  measurePaged();
-}
-
 /** 正文渲染后恢复阅读位置：翻页模式按页码，滚动模式按滚动量 */
 async function restoreReadingPosition(chapterId: number, seq: number) {
   if (seq !== contentSeq || !chapterText.value) return;
@@ -413,8 +456,8 @@ async function restoreReadingPosition(chapterId: number, seq: number) {
   if (pagedMode.value) {
     await relayoutPaged();
     if (seq !== contentSeq) return;
-    const wantLast = pendingLastPageFor === chapterId;
-    if (wantLast) pendingLastPageFor = null;
+    const wantLast = pendingLastPageFor.value === chapterId;
+    if (wantLast) pendingLastPageFor.value = null;
     const ratio = searchJump
       ? searchJump.offset / Math.max(1, chapterText.value.length)
       : remotePos != null
@@ -498,88 +541,18 @@ async function loadChapterContent(chapterId: number) {
   if (ok) void prefetchNextChapter();
 }
 
-/** 按真实总章数换算阅读进度 0–100 */
-const readPercent = computed(() => {
-  const total = chapterTotal.value;
-  const n = chapterNo.value;
-  if (!total || !n) return Number(book.value?.read_percent ?? 0) || 0;
-  return Math.min(100, Math.round((n / total) * 100));
-});
-
-/** 展示用整体进度：章节序号 + 章内滚动/页码占比 */
-const overallPercent = computed(() => {
-  const total = chapterTotal.value;
-  const n = chapterNo.value;
-  if (!total || !n) return Number(book.value?.read_percent ?? 0) || 0;
-  const frac = pagedMode.value
-    ? pageCount.value > 0
-      ? (pageIndex.value + 1) / pageCount.value
-      : 0
-    : scrollFraction.value;
-  return Math.min(100, Math.max(0, Math.round(((n - 1 + frac) / total) * 100)));
-});
-
-const readerStyle = computed(() => ({
-  fontSize: `${fontSize.value}px`,
-  lineHeight: String(lineHeight.value),
-}));
-
-/** 正文排版：字体族与内容宽度 */
-const articleStyle = computed(() => ({
-  fontFamily: FONT_STACKS[readerFont.value] || FONT_STACKS.serif,
-  maxWidth: `${contentWidth.value}px`,
-}));
-
-/** 翻页模式：正文按栏排布，整体横向平移展示当前页 */
-const pagedArticleStyle = computed<Record<string, string>>(() => ({
-  fontFamily: FONT_STACKS[readerFont.value] || FONT_STACKS.serif,
-  columnWidth: `${pageWidth.value}px`,
-  columnGap: `${PAGE_GAP}px`,
-  columnFill: "auto",
-  transform: `translateX(-${pageIndex.value * (pageWidth.value + PAGE_GAP)}px)`,
-}));
-/** 翻页模式下的内容宽度变量（供 track 的 max-width 使用） */
-const pagedVars = computed<Record<string, string>>(() => {
-  const vars: Record<string, string> = {};
-  if (pagedMode.value) vars["--paged-width"] = `${contentWidth.value}px`;
-  return vars;
-});
-
-const themeClass = computed(() => `theme-${readerTheme.value}`);
-
-/** 写回阅读进度（百分比 + 章节序号），失败静默不打断阅读 */
-async function persistProgress() {
-  if (!bookId.value) return;
-  try {
-    await updateReadProgress(bookId.value, {
-      percent: readPercent.value,
-      chapter_index: activeChapter.value?.index ?? -1,
-    });
-    if (book.value) book.value.read_percent = readPercent.value;
-  } catch {
-    /* 阅读器不阻断 */
-  }
-}
-
 async function load() {
   if (!bookId.value) return;
   const loadBookId = bookId.value;
   loading.value = true;
-  pendingRemotePos.value = null;
+  resetSync();
   pendingSearchJump.value = null;
   activeHighlightQuery.value = "";
-  lateRemote.value = null;
+  tocError.value = "";
   setSyncState("syncing");
 
   // 与书籍/目录并行拉取；最多等 1.4 秒，超时后先按本地进度阅读
-  const pullTask = pullBookProgress(loadBookId).then(
-    (r) => (bookId.value === loadBookId ? r : null),
-    () => {
-      if (bookId.value === loadBookId) setSyncState("failed");
-      return null;
-    },
-  );
-  const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 1400));
+  const pullTask = startPull(loadBookId);
 
   try {
     book.value = await fetchBook(bookId.value);
@@ -588,9 +561,10 @@ async function load() {
       const toc = await fetchAllBookChapters(bookId.value);
       tocItems.value = toc.items;
       tocTotal.value = toc.total || toc.items.length;
-    } catch {
+    } catch (e) {
       tocItems.value = [];
       tocTotal.value = Number(book.value?.chapter_count) || 0;
+      tocError.value = e instanceof Error ? e.message : "目录加载失败";
     }
     const list = chapters.value;
     if (!list.length) {
@@ -599,29 +573,7 @@ async function load() {
     }
 
     // 书籍/目录与进度拉取并行；到这里通常已有结果，最坏再等剩余时间
-    const pulled = await Promise.race([pullTask, timeout]);
-    if (pulled) {
-      setSyncState(pulled.enabled ? "synced" : "idle");
-    } else if (syncState.value !== "failed") {
-      setSyncState("syncing");
-      void pullTask.then((late) => {
-        if (bookId.value !== loadBookId) return;
-        if (!late) {
-          setSyncState("failed");
-          return;
-        }
-        if (!late.enabled) {
-          setSyncState("idle");
-          return;
-        }
-        if (late.updated && late.chapter_id) {
-          lateRemote.value = late;
-          setSyncState("remote_newer");
-        } else {
-          setSyncState("synced");
-        }
-      });
-    }
+    const pulled = await awaitPull(loadBookId, pullTask);
 
     const remoteTarget =
       pulled?.updated && pulled.chapter_id
@@ -650,38 +602,6 @@ async function load() {
   } finally {
     loading.value = false;
   }
-}
-
-/** 晚到的远端进度：用户点击后再切换，避免打断当前阅读 */
-async function applyLateRemote() {
-  const remote = lateRemote.value;
-  if (!remote?.chapter_id) return;
-  const target = chapters.value.find((c) => c.id === remote.chapter_id);
-  lateRemote.value = null;
-  if (!target) {
-    setSyncState("idle");
-    return;
-  }
-  if (typeof remote.chapter_pos === "number" && remote.chapter_pos > 0) {
-    pendingRemotePos.value = { chapterId: target.id, pos: remote.chapter_pos };
-  }
-  setSyncState("synced");
-  if (target.id === activeChapterId.value) {
-    await loadChapterContent(target.id);
-  } else {
-    activeChapterId.value = target.id;
-  }
-}
-
-function persistPrefs() {
-  localStorage.setItem("novel_read_font", String(fontSize.value));
-  localStorage.setItem("novel_read_leading", String(lineHeight.value));
-  localStorage.setItem("novel_read_theme", readerTheme.value);
-  localStorage.setItem("novel_read_font_family", readerFont.value);
-  localStorage.setItem("novel_read_width", String(contentWidth.value));
-  localStorage.setItem("novel_read_autohide", autoHideTopbar.value ? "1" : "0");
-  localStorage.setItem("novel_read_mode", pagedMode.value ? "paged" : "scroll");
-  localStorage.setItem("novel_read_toc", tocOpen.value ? "1" : "0");
 }
 
 function clearTopbarTimer() {
@@ -732,6 +652,13 @@ function toggleTopbar() {
   }
 }
 
+/** 面板互斥：打开一个时收起其它浮层 */
+function closeOtherPanels() {
+  searchOpen.value = false;
+  settingsOpen.value = false;
+  helpOpen.value = false;
+}
+
 function toggleToc() {
   tocOpen.value = !tocOpen.value;
   localStorage.setItem("novel_read_toc", tocOpen.value ? "1" : "0");
@@ -743,6 +670,7 @@ function toggleSettings() {
   settingsOpen.value = !settingsOpen.value;
   if (settingsOpen.value) {
     helpOpen.value = false;
+    sourceOpen.value = false;
     revealTopbar();
   } else {
     scheduleTopbarHide();
@@ -753,74 +681,13 @@ function openSearch() {
   searchOpen.value = true;
   settingsOpen.value = false;
   helpOpen.value = false;
+  sourceOpen.value = false;
   revealTopbar();
 }
 
 function toggleSearch() {
   if (searchOpen.value) searchOpen.value = false;
   else openSearch();
-}
-
-async function runSearch() {
-  const q = searchQuery.value.trim();
-  if (!q || !bookId.value) return;
-  const seq = ++searchSeq;
-  searchLoading.value = true;
-  searchError.value = "";
-  try {
-    const data = await searchBookContent(bookId.value, q);
-    if (seq !== searchSeq) return;
-    searchHits.value = data.items || [];
-    searchTotal.value = Number(data.total) || 0;
-    if (!searchHits.value.length) searchError.value = "没有找到相关内容";
-  } catch (e) {
-    if (seq !== searchSeq) return;
-    searchHits.value = [];
-    searchTotal.value = 0;
-    searchError.value = e instanceof Error ? e.message : "搜索失败";
-  } finally {
-    if (seq === searchSeq) searchLoading.value = false;
-  }
-}
-
-/** 对当前已加载章节执行搜索跳转（同章命中时） */
-async function applySearchJump() {
-  const jump = pendingSearchJump.value;
-  if (!jump || jump.chapterId !== activeChapterId.value || !chapterText.value) return;
-  pendingSearchJump.value = null;
-  activeHighlightQuery.value = jump.query;
-  await nextTick();
-  if (!contentEl.value) return;
-  if (pagedMode.value) {
-    await relayoutPaged();
-    const last = Math.max(0, pageCount.value - 1);
-    pageIndex.value = Math.min(
-      last,
-      Math.max(0, Math.round((jump.offset / Math.max(1, chapterText.value.length)) * last)),
-    );
-    return;
-  }
-  const top = scrollTopForChar(jump.offset);
-  scrollSuppressed = true;
-  contentEl.value.scrollTo({ top, behavior: "auto" });
-  lastScrollTop = top;
-  requestAnimationFrame(() => {
-    scrollSuppressed = false;
-  });
-}
-
-function openSearchResult(hit: BookSearchHit) {
-  pendingSearchJump.value = {
-    chapterId: hit.chapter_id,
-    offset: hit.offset,
-    query: searchQuery.value.trim(),
-  };
-  searchOpen.value = false;
-  if (hit.chapter_id === activeChapterId.value) {
-    void applySearchJump();
-  } else {
-    goChapter(hit.chapter_id);
-  }
 }
 
 function goBack() {
@@ -870,7 +737,7 @@ watch(activeChapterId, (id, oldId) => {
 // 切换阅读模式：翻页模式重新分页；滚动模式恢复该章滚动位置
 watch(pagedMode, async (on) => {
   const id = activeChapterId.value;
-  pendingLastPageFor = null;
+  pendingLastPageFor.value = null;
   if (on) maybeShowPagedHint();
   if (!id) return;
   if (on) {
@@ -890,20 +757,7 @@ watch(pagedMode, async (on) => {
   scheduleTopbarHide();
 });
 
-// 字号/行距/宽度/字体变化后重新分页（滑杆拖动时防抖）
-let pagedLayoutTimer: ReturnType<typeof setTimeout> | undefined;
-watch([fontSize, lineHeight, contentWidth, readerFont], () => {
-  if (!pagedMode.value) return;
-  clearTimeout(pagedLayoutTimer);
-  pagedLayoutTimer = setTimeout(() => void relayoutPaged(), 120);
-});
-
-// 目录/排版面板开合会改变桌面端正文宽度，需要重新分页
-watch([tocOpen, settingsOpen], async () => {
-  if (!pagedMode.value) return;
-  await nextTick();
-  await relayoutPaged();
-});
+// 字号/行距/宽度/字体与面板开合后的重新分页由 useReaderPaging 内部处理
 // 路由 :id 变化（组件复用）时重置并重新加载，避免显示上一本
 watch(bookId, (_next, prev) => {
   // 切书前把当前章位置写回上一本书（此时 bookId 已是新值，需显式传 prev）
@@ -913,30 +767,24 @@ watch(bookId, (_next, prev) => {
   book.value = null;
   tocItems.value = [];
   tocTotal.value = 0;
+  tocError.value = "";
   chapterText.value = "";
   chapterError.value = "";
   activeChapterId.value = null;
   // 切书时关闭并清空书内搜索
-  searchOpen.value = false;
-  searchQuery.value = "";
-  searchHits.value = [];
-  searchTotal.value = 0;
-  searchError.value = "";
+  resetSearch();
+  // 换源面板同样按书隔离
+  resetSources();
   // 换书后重置目录筛选、沉浸状态与正文缓存
   tocFilter.value = "";
   clearTopbarTimer();
   scrollSuppressed = false;
   lastScrollTop = 0;
   topbarHidden.value = false;
-  pendingLastPageFor = null;
-  pendingRemotePos.value = null;
   pendingSearchJump.value = null;
   activeHighlightQuery.value = "";
-  lateRemote.value = null;
-  clearTimeout(syncStateTimer);
-  syncState.value = "idle";
-  pageIndex.value = 0;
-  pageCount.value = 1;
+  resetSync();
+  resetPaging();
   chapterCache.clear();
   prefetching.clear();
   void load();
@@ -968,37 +816,7 @@ function goChapter(id: number) {
   activeChapterId.value = id;
 }
 
-/** 翻页模式：下一页 / 下一章 */
-function nextPage() {
-  if (!pagedMode.value) return;
-  if (pageIndex.value + 1 < pageCount.value) {
-    pageIndex.value += 1;
-    const id = activeChapterId.value;
-    if (id) rememberPage(id, pageIndex.value);
-    scheduleTopbarHide();
-    return;
-  }
-  if (hasNext.value) goNextChapter();
-}
-
-/** 翻页模式：上一页 / 上一章（跨章落到上一章最后一页） */
-function prevPage() {
-  if (!pagedMode.value) return;
-  if (pageIndex.value > 0) {
-    pageIndex.value -= 1;
-    const id = activeChapterId.value;
-    if (id) rememberPage(id, pageIndex.value);
-    scheduleTopbarHide();
-    return;
-  }
-  const list = chapters.value;
-  const n = chapterNo.value;
-  const target = n > 1 ? list[n - 2] : undefined;
-  if (target) {
-    pendingLastPageFor = target.id;
-    goChapter(target.id);
-  }
-}
+/** 翻页模式：下一页 / 下一章 与 上一页 / 上一章（跨章落页）由 useReaderPaging 提供 */
 
 function goPrevChapter() {
   const list = chapters.value;
@@ -1016,8 +834,6 @@ function goNextChapter() {
   if (target) goChapter(target.id);
 }
 
-const contentEl = ref<HTMLElement | null>(null);
-
 async function toggleFullscreen() {
   const el = document.documentElement;
   try {
@@ -1031,11 +847,6 @@ async function toggleFullscreen() {
   } catch {
     isFullscreen.value = false;
   }
-}
-
-/** 快捷键调整字号（14–28） */
-function changeFont(delta: number) {
-  fontSize.value = Math.min(28, Math.max(14, fontSize.value + delta));
 }
 
 /** PageUp / PageDown：翻页模式翻页，滚动模式翻一屏 */
@@ -1056,6 +867,7 @@ function toggleHelp() {
   if (helpOpen.value) {
     searchOpen.value = false;
     settingsOpen.value = false;
+    sourceOpen.value = false;
   }
 }
 
@@ -1071,6 +883,7 @@ function onKeydown(e: KeyboardEvent) {
     if (searchOpen.value) {
       searchOpen.value = false;
     }
+    sourceOpen.value = false;
     helpOpen.value = false;
     settingsOpen.value = false;
     // 窄屏 Esc 关掉目录抽屉
@@ -1180,70 +993,14 @@ function onContentClick(e: MouseEvent) {
   else if (x > rect.width * 0.7) nextPage();
 }
 
-let pagedResizeTimer: ReturnType<typeof setTimeout> | undefined;
-
 function onResize() {
   isNarrow.value = window.innerWidth < 900;
-  if (pagedMode.value) {
-    clearTimeout(pagedResizeTimer);
-    pagedResizeTimer = setTimeout(() => void relayoutPaged(), 150);
-  }
+  if (pagedMode.value) scheduleResizeRelayout();
 }
 
 /** 桌面端鼠标靠近窗口顶部时唤起顶栏 */
 function onMouseMove(e: MouseEvent) {
   if (e.clientY <= 72) revealTopbar();
-}
-
-/** 估算章内字符位置（滚动/翻页进度换算，供 Legado 落点参考） */
-function estimateChapterPos(): number {
-  const text = chapterText.value || "";
-  if (!text) return 0;
-  if (pagedMode.value && pageCount.value > 1) {
-    return Math.round((pageIndex.value / (pageCount.value - 1)) * text.length);
-  }
-  const el = contentEl.value;
-  if (!el) return 0;
-  const max = Math.max(1, el.scrollHeight - el.clientHeight);
-  return Math.max(0, Math.min(text.length, Math.round((el.scrollTop / max) * text.length)));
-}
-
-/** 关闭/隐藏页面时把进度推送到 WebDAV（Beacon 不阻塞页面） */
-function pushProgressBeacon() {
-  const bid = bookId.value;
-  const chid = activeChapterId.value;
-  if (!bid || !chid) return;
-  const now = Date.now();
-  if (now - lastBeaconAt < 4000) return;
-  lastBeaconAt = now;
-  const body = JSON.stringify({
-    chapter_id: chid,
-    chapter_pos: estimateChapterPos(),
-    client_time: now,
-  });
-  const url = `/api/admin/books/${bid}/sync/push`;
-  // 优先 fetch+keepalive（保留 JSON Content-Type），失败再退回 Beacon
-  try {
-    void fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      credentials: "include",
-      keepalive: true,
-    }).catch(() => {
-      if (navigator.sendBeacon) {
-        navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
-      }
-    });
-  } catch {
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
-    }
-  }
-}
-
-function onVisibilityChange() {
-  if (document.visibilityState === "hidden") pushProgressBeacon();
 }
 
 onMounted(() => {
@@ -1265,10 +1022,8 @@ onUnmounted(() => {
   // 组件内跳转（如返回书库）不会触发 pagehide，这里补一次推送
   pushProgressBeacon();
   clearTimeout(scrollTimer);
-  clearTimeout(pagedResizeTimer);
-  clearTimeout(pagedLayoutTimer);
-  clearTimeout(syncStateTimer);
-  clearTimeout(pagedHintTimer);
+  disposePaging();
+  disposeSync();
   clearTopbarTimer();
   // 离开阅读器时落盘一次章内位置与进度
   if (activeChapterId.value) {
@@ -1289,10 +1044,13 @@ onUnmounted(() => {
       :toc-open="tocOpen"
       :search-open="searchOpen"
       :settings-open="settingsOpen"
+      :source-open="sourceOpen"
+      :online="isOnlineBook"
       :sync-state="syncState"
       @back="goBack"
       @toggle-toc="toggleToc"
       @toggle-search="toggleSearch"
+      @toggle-sources="toggleSources"
       @toggle-settings="toggleSettings"
       @fullscreen="toggleFullscreen"
       @apply-remote="applyLateRemote"
@@ -1354,7 +1112,8 @@ onUnmounted(() => {
             </p>
           </div>
           <div v-else class="placeholder-body muted">
-            <p>选择左侧目录开始阅读。</p>
+            <p v-if="tocError">目录加载失败：{{ tocError }}</p>
+            <p v-else>选择左侧目录开始阅读。</p>
           </div>
           <!-- 章末导航：随正文滚动，不固定视口底部 -->
           <nav class="chapter-nav">
@@ -1395,6 +1154,19 @@ onUnmounted(() => {
         @select="openSearchResult"
       />
 
+      <ReaderSourcePanel
+        v-if="sourceOpen"
+        :current-source-name="sourceCurrentName"
+        :items="sourceItems"
+        :loading="sourceLoading"
+        :error="sourceError"
+        :hint="sourceHint"
+        :switching-id="switchingSource"
+        @close="sourceOpen = false"
+        @refresh="loadSources"
+        @select="applySource"
+      />
+
       <ReaderSettingsPanel
         v-if="settingsOpen"
         v-model:paged-mode="pagedMode"
@@ -1410,7 +1182,7 @@ onUnmounted(() => {
     <!-- 首次进入翻页模式的交互提示 -->
     <div v-if="pagedHint" class="paged-hint">
       <span>点击正文左右区域或左右滑动翻页；章末继续翻进入下一章</span>
-      <button type="button" @click="pagedHint = false">知道了</button>
+      <button type="button" @click="dismissPagedHint">知道了</button>
     </div>
 
     <!-- 整体阅读进度条与翻页页码 -->

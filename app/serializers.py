@@ -129,8 +129,8 @@ def book_list_item(book: Book, base: str | None = None) -> dict:
         "status": book.status,
         "source": getattr(book, "source", "") or "",
         "source_id": getattr(book, "source_id", "") or "",
-        # 在线搜索登记进来的书（无本地正文）：source_path 统一以 online: 开头，
-        # 前端据此显示「在线」角标并禁用阅读器入口，避免点进空目录
+        # 在线搜索登记进来的书：source_path 统一以 online: 开头，前端据此显示
+        # 「在线」角标；正文由服务端按需从原书源抓取，同样可以阅读
         "online": str(getattr(book, "source_path", "") or "").startswith("online:"),
         # 在线书的原站地址（给「去原书源阅读」用）；本地书为空
         "book_url": (

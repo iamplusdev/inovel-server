@@ -21,6 +21,7 @@ URL 后带 ``,{"method":"POST"}`` 配置的搜索接口。
 """
 from __future__ import annotations
 
+import html as html_lib
 import json
 import re
 from typing import Any
@@ -35,12 +36,20 @@ __all__ = [
     "read_field",
     "fetch_text",
     "search_source",
+    "toc_source",
+    "content_source",
 ]
 
 # 单字段最大长度：书源规则偶尔命中整页文本，截断避免把巨串塞进响应
 MAX_FIELD_CHARS = 2000
 # 单次搜索最多返回条数，防止某个书源返回整站目录把我方内存打满
 MAX_RESULTS = 30
+# 目录分页 / 章节数上限：防止个别书源的分页规则死循环拉爆内存
+MAX_TOC_PAGES = 20
+MAX_TOC_CHAPTERS = 20000
+# 单章正文上限（含 nextContentUrl 合并后的多页）
+MAX_CONTENT_CHARS = 500_000
+MAX_CONTENT_PAGES = 5
 
 _JS_MARK = re.compile(r"(?:^@js\s*:|<js>|@js\s*:)", re.IGNORECASE)
 _TEMPLATE = re.compile(r"\{\{(.*?)\}\}", re.S)
@@ -610,3 +619,286 @@ def search_source(
             }
         )
     return items
+
+
+# ---------------------------------------------------------------- 目录 / 正文
+
+
+def _source_base(source: dict) -> str:
+    return str(source.get("bookSourceUrl") or "").strip().rstrip("/")
+
+
+def _fetch_page(url: str, headers: dict[str, str], timeout: float) -> tuple[Any, str]:
+    """抓取并解析为可查询节点，返回 (node, kind)。"""
+    text = fetch_text(url, headers=headers, timeout=timeout)
+    kind = detect_kind(text)
+    return parse_content(text, kind), kind
+
+
+def _looks_like_url(value: str) -> bool:
+    return value.startswith(("http://", "https://", "//", "/"))
+
+
+def _template_only_url(rule: str, variables: dict[str, Any], base_url: str) -> str:
+    """规则是纯模板（如 ``{{bookUrl}}/toc``）时直接得到地址，省一次书页请求。"""
+    if "{{" not in rule:
+        return ""
+    rendered = render_template(rule, variables)
+    if "{{" in rendered or not _looks_like_url(rendered):
+        return ""
+    return _absolute(base_url, rendered)
+
+
+def _read_url_rule(
+    rule: str,
+    node: Any,
+    *,
+    kind: str,
+    variables: dict[str, Any],
+    base_url: str,
+) -> str:
+    """求值「返回地址」的规则：既支持 CSS/XPath/JSON 取 href，也支持纯模板 URL。"""
+    rule = (rule or "").strip()
+    if not rule:
+        return ""
+    rendered = render_template(rule, variables)
+    if rendered.startswith(("http://", "https://")):
+        return rendered
+    if "{{" in rule and _looks_like_url(rendered):
+        return _absolute(base_url, rendered)
+    if rule.startswith("/") and not re.search(r"[\s@>]", rule):
+        return _absolute(base_url, rule)
+    value = read_field(rule, node, kind=kind, variables=variables, base_url=base_url)
+    return _absolute(base_url, value)
+
+
+def toc_source(
+    source: dict,
+    book_url: str,
+    *,
+    book_name: str = "",
+    book_author: str = "",
+    toc_url: str = "",
+    timeout: float = 12.0,
+    max_pages: int = MAX_TOC_PAGES,
+) -> list[dict]:
+    """执行书源的目录规则，返回 ``[{title, url}]``。
+
+    流程与 Legado 一致：先按 ``ruleBookInfo.tocUrl`` 找目录页（没有就直接用书籍页），
+    再在目录页上执行 ``ruleToc.chapterList``，并跟随 ``nextTocUrl`` 翻页。
+    没有正文地址的卷名/占位行直接跳过，保证每条目录都能读取。
+    """
+    book_url = (book_url or "").strip()
+    if not book_url:
+        raise RuleError("缺少书籍地址")
+
+    rule_toc = source.get("ruleToc") or {}
+    if not isinstance(rule_toc, dict):
+        raise RuleError("ruleToc 规则必须是对象")
+    list_rule = str(rule_toc.get("chapterList") or "").strip()
+    if not list_rule:
+        raise RuleError("书源缺少 ruleToc.chapterList")
+
+    base = _source_base(source)
+    headers = _headers(source)
+    variables = {
+        "baseUrl": base,
+        "base": base,
+        "bookUrl": book_url,
+        "bookName": book_name,
+        "bookAuthor": book_author,
+        "tocUrl": (toc_url or book_url).strip(),
+    }
+
+    # 1) 定位目录页：搜索结果已带 toc_url 时直接用；否则执行 ruleBookInfo.tocUrl
+    resolved = (toc_url or "").strip()
+    page = None
+    kind = "html"
+    fetched_url = ""
+    if not resolved:
+        info = source.get("ruleBookInfo") or {}
+        info_rule = str(info.get("tocUrl") or "").strip() if isinstance(info, dict) else ""
+        if info_rule:
+            direct = _template_only_url(info_rule, variables, base)
+            if direct:
+                resolved = direct
+            else:
+                page, kind = _fetch_page(book_url, headers, timeout)
+                fetched_url = book_url
+                resolved = _read_url_rule(
+                    info_rule, page, kind=kind, variables=variables, base_url=base
+                )
+    if not resolved:
+        resolved = book_url
+    if page is None or resolved != fetched_url:
+        page, kind = _fetch_page(resolved, headers, timeout)
+        fetched_url = resolved
+    variables["tocUrl"] = resolved
+
+    # 2) 解析章节列表，按 nextTocUrl 翻页（有上限，避免规则异常时死循环）
+    chapters: list[dict] = []
+    seen_pages: set[str] = set()
+    seen_urls: set[str] = set()
+    url = resolved
+    while url and url not in seen_pages and len(seen_pages) < max(1, max_pages):
+        seen_pages.add(url)
+        if url != fetched_url:
+            page, kind = _fetch_page(url, headers, timeout)
+            fetched_url = url
+        nodes = select_nodes(list_rule, page, kind=kind, variables=variables, base_url=base)
+        for node in nodes:
+            title = read_field(
+                str(rule_toc.get("chapterName") or ""),
+                node,
+                kind=kind,
+                variables=variables,
+                base_url=base,
+            )
+            link = _read_url_rule(
+                str(rule_toc.get("chapterUrl") or ""),
+                node,
+                kind=kind,
+                variables=variables,
+                base_url=base,
+            )
+            if not link or link in seen_urls:
+                continue
+            seen_urls.add(link)
+            chapters.append({"title": title[:200] or f"第 {len(chapters) + 1} 章", "url": link})
+            if len(chapters) >= MAX_TOC_CHAPTERS:
+                break
+        if len(chapters) >= MAX_TOC_CHAPTERS:
+            break
+        next_rule = str(rule_toc.get("nextTocUrl") or "").strip()
+        if not next_rule:
+            break
+        url = _read_url_rule(
+            next_rule,
+            page,
+            kind=kind,
+            variables={**variables, "page": len(seen_pages) + 1},
+            base_url=base,
+        )
+
+    if not chapters:
+        raise RuleError("目录规则没有解析到章节（检查 ruleToc.chapterList / chapterUrl）")
+    return chapters
+
+
+_SCRIPT_STYLE = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1\s*>")
+_BR_TAG = re.compile(r"(?is)<\s*br\s*/?\s*>")
+_BLOCK_END = re.compile(
+    r"(?is)</\s*(?:p|div|section|article|h[1-6]|li|tr|ul|ol|table|blockquote)\s*>"
+)
+_ANY_TAG = re.compile(r"(?s)<[^>]*>")
+_INLINE_SPACE = re.compile(r"[ \t\f\v\u00a0]+")
+
+
+def _html_to_text(raw: str) -> str:
+    """正文 HTML → 纯文本：保留段落/换行，去掉脚本、样式与标签。"""
+    if not raw or "<" not in raw:
+        return raw or ""
+    text = _SCRIPT_STYLE.sub("", raw)
+    text = _BR_TAG.sub("\n", text)
+    text = _BLOCK_END.sub("\n", text)
+    text = _ANY_TAG.sub("", text)
+    return html_lib.unescape(text).replace("\xa0", " ")
+
+
+def _clean_content(text: str) -> str:
+    """压缩行内空白、合并多余空行，保证阅读器按空行分段。"""
+    lines: list[str] = []
+    blank = False
+    for line in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = _INLINE_SPACE.sub(" ", line).strip()
+        if line:
+            lines.append(line)
+            blank = False
+        elif lines and not blank:
+            lines.append("")
+            blank = True
+    return "\n".join(lines).strip()
+
+
+def _node_inner_html(node: Any) -> str:
+    if hasattr(node, "decode_contents"):
+        return node.decode_contents()
+    if callable(getattr(node, "xpath", None)):
+        from lxml import etree
+
+        return "".join(etree.tostring(child, encoding="unicode") for child in node)
+    return _as_text(node)
+
+
+def read_content_text(
+    rule: str,
+    node: Any,
+    *,
+    kind: str = "html",
+    variables: dict[str, Any] | None = None,
+    base_url: str = "",
+) -> str:
+    """在章节页上执行正文规则，返回清洗后的纯文本。"""
+    nodes = select_nodes(rule, node, kind=kind, variables=variables or {}, base_url=base_url)
+    chunks: list[str] = []
+    for item in nodes:
+        if isinstance(item, str):
+            chunks.append(_html_to_text(item))
+        elif isinstance(item, (dict, list)):
+            chunks.append(_as_text(item))
+        else:
+            chunks.append(_html_to_text(_node_inner_html(item)))
+    return _clean_content("\n".join(chunk for chunk in chunks if chunk and chunk.strip()))
+
+
+def content_source(
+    source: dict,
+    chapter_url: str,
+    *,
+    book_url: str = "",
+    chapter_title: str = "",
+    timeout: float = 15.0,
+) -> str:
+    """执行书源的正文规则，返回清洗后的章节文本（支持 nextContentUrl 续页）。"""
+    chapter_url = (chapter_url or "").strip()
+    if not chapter_url:
+        raise RuleError("缺少章节地址")
+    rule = source.get("ruleContent") or {}
+    if not isinstance(rule, dict):
+        raise RuleError("ruleContent 规则必须是对象")
+    content_rule = str(rule.get("content") or "").strip()
+    if not content_rule:
+        raise RuleError("书源缺少 ruleContent.content")
+
+    base = _source_base(source)
+    headers = _headers(source)
+    variables = {
+        "baseUrl": base,
+        "base": base,
+        "bookUrl": book_url,
+        "chapterUrl": chapter_url,
+        "chapterTitle": chapter_title,
+    }
+
+    texts: list[str] = []
+    seen: set[str] = set()
+    url = chapter_url
+    for _ in range(MAX_CONTENT_PAGES):
+        if not url or url in seen:
+            break
+        seen.add(url)
+        page, kind = _fetch_page(url, headers, timeout)
+        chunk = read_content_text(
+            content_rule, page, kind=kind, variables=variables, base_url=base
+        )
+        if chunk:
+            texts.append(chunk)
+        next_rule = str(rule.get("nextContentUrl") or "").strip()
+        if not next_rule:
+            break
+        url = _read_url_rule(next_rule, page, kind=kind, variables=variables, base_url=base)
+
+    text = "\n".join(texts).strip()
+    if not text:
+        raise RuleError("正文规则未匹配到内容（可能依赖 JS 规则或被站点限制）")
+    return text[:MAX_CONTENT_CHARS]

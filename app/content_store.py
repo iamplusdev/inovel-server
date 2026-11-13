@@ -105,6 +105,25 @@ def read_chapter_text(
     return legacy_content or ""
 
 
+_APPEND_LOCK = Lock()
+
+
+def append_chapter_text(book_id: int, text: str) -> tuple[int, int, int]:
+    """把一章正文追加到正文包末尾，返回 (byte_offset, byte_len, char_len)。
+
+    在线书按需抓取正文时使用：不重写整包，只追加新章节并回填偏移。
+    """
+    value = text or ""
+    raw = value.encode("utf-8")
+    with _APPEND_LOCK:
+        path = content_pack_path(book_id)
+        offset = path.stat().st_size if path.is_file() else 0
+        with path.open("ab") as f:
+            f.write(raw)
+    _invalidate_book(book_id)
+    return offset, len(raw), len(value)
+
+
 def read_book_texts(book_id: int, spans: Sequence[tuple[int, int]]) -> list[str]:
     """按 (offset, length) 列表读整本书章节（体检/修复用）。
 

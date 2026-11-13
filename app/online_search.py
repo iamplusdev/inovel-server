@@ -279,6 +279,20 @@ def add_to_library(db: Session, payload: dict) -> dict:
     marker = ONLINE_PREFIX + book_url[:490]
     existing = db.execute(select(Book).where(Book.source_path == marker)).scalar_one_or_none()
     if existing is not None:
+        # 早期登记的书没有来源字段：补齐后再次打开即可在线读取
+        changed = False
+        if not int(existing.remote_source_id or 0):
+            existing.remote_source_id = int(source_row.id)
+            changed = True
+        if not str(existing.remote_book_url or ""):
+            existing.remote_book_url = book_url[:1000]
+            changed = True
+        toc_url = str(payload.get("toc_url") or "").strip()[:1000]
+        if toc_url and not str(existing.remote_toc_url or ""):
+            existing.remote_toc_url = toc_url
+            changed = True
+        if changed:
+            db.commit()
         return {
             "book_id": int(existing.id),
             "created": False,
@@ -298,6 +312,9 @@ def add_to_library(db: Session, payload: dict) -> dict:
         cover_file="",
         source_path=marker,
         source_hash="",
+        remote_source_id=int(source_row.id),
+        remote_book_url=book_url[:1000],
+        remote_toc_url=str(payload.get("toc_url") or "").strip()[:1000],
         word_count=_parse_word_count(payload.get("word_count")),
         chapter_count=0,
         latest_chapter=str(payload.get("last_chapter") or "").strip()[:200],
@@ -325,7 +342,7 @@ def add_to_library(db: Session, payload: dict) -> dict:
         "book_id": int(book.id),
         "created": True,
         "title": book.title,
-        "hint": "已加入书库；正文需在原书源阅读",
+        "hint": "已加入书库；打开后会从原书源加载目录与正文",
     }
 
 

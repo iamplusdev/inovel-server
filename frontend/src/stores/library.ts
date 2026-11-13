@@ -5,6 +5,27 @@ import type { AdminStats, BookListItem, BookListResponse } from "@/api/types";
 /** 书源行选项（与旧版 SOURCE_OPTS 一致） */
 export const SOURCE_OPTS = ["", "起点", "番茄", "纵横"] as const;
 
+/** 书库筛选 → URL query；书架与在线搜索页共用，切页返回时保留筛选 */
+export function libraryRouteQuery(s: {
+  q: string;
+  source: string;
+  category: string;
+  sort: string;
+  onlyUnscraped: boolean;
+  origin: string;
+  page: number;
+}): Record<string, string> {
+  const next: Record<string, string> = {};
+  if (s.q) next.q = s.q;
+  if (s.source) next.source = s.source;
+  if (s.category) next.category = s.category;
+  if (s.sort && s.sort !== "updated") next.sort = s.sort;
+  if (s.onlyUnscraped) next.unscraped = "1";
+  if (s.origin && s.origin !== "all") next.origin = s.origin;
+  if (s.page > 1) next.page = String(s.page);
+  return next;
+}
+
 interface LibraryState {
   stats: AdminStats | null;
   items: BookListItem[];

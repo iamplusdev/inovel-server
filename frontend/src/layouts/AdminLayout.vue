@@ -32,17 +32,24 @@ function syncNarrow() {
 const navItems = [
   { path: "/", label: "书库", name: "library", icon: "library" },
   { path: "/import", label: "导入", name: "import", icon: "import" },
-  { path: "/check", label: "体检", name: "check", icon: "check" },
+  { path: "/maintenance", label: "维护", name: "maintenance", icon: "check" },
   { path: "/stats", label: "统计", name: "stats", icon: "stats" },
-  { path: "/api-docs", label: "API", name: "api-docs", icon: "api" },
-  { path: "/book-sources", label: "书源", name: "book-sources", icon: "list" },
-  { path: "/shelf-restore", label: "书架同步", name: "shelf-restore", icon: "refresh" },
+  { path: "/access", label: "接入", name: "access", icon: "api" },
   { path: "/settings", label: "设置", name: "settings", icon: "settings" },
 ];
 
+/** 分组壳内的子路由归属到一级导航 */
+const navGroups: Record<string, string[]> = {
+  access: ["book-sources", "api-docs"],
+  maintenance: ["check", "shelf-restore"],
+};
+
 const activeName = computed(() => {
-  if (route.name === "book-detail") return "library";
-  return String(route.name || "library");
+  const name = String(route.name || "library");
+  if (name === "book-detail" || name === "online-search") return "library";
+  if (navGroups.access.includes(name)) return "access";
+  if (navGroups.maintenance.includes(name)) return "maintenance";
+  return name;
 });
 
 const themeIcon = computed(() => {
@@ -53,7 +60,10 @@ const themeIcon = computed(() => {
 
 /** 用 named 路由跳转：避免 el-menu router 模式把 name 当 path，在详情页点不动 */
 function onMenuSelect(name: string) {
-  if (!name || name === String(route.name)) {
+  const current = String(route.name || "");
+  // 已在该分组内时不再跳转，避免从「API」页签被拉回分组默认页
+  const inGroup = navGroups[name]?.includes(current) ?? false;
+  if (!name || name === current || inGroup) {
     drawerOpen.value = false;
     return;
   }

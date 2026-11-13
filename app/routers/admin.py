@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from .. import stats_cache
@@ -35,7 +35,9 @@ from ..importer import (
     import_all_async,
     request_import_cancel,
 )
-from ..models import Book, Chapter
+from ..models import Book, Chapter, LegadoShelfBook
+from ..online_reader import OnlineReadError, ensure_toc
+from ..online_search import is_online_book
 from ..serializers import (
     admin_book_detail,
     book_list_item,
@@ -278,6 +280,39 @@ def admin_duplicates(db: Session = Depends(get_db)) -> dict:
     return {"items": items, "total": len(items)}
 
 
+@router.get("/books/facets")
+def admin_book_facets(db: Session = Depends(get_db)) -> dict:
+    """书库筛选候选：分类 / 书源（含仅 Legado 在线书），供客户端下拉框使用。"""
+    def _merged(rows: list[tuple[str, int]], extra: list[tuple[str, int]]) -> list[str]:
+        counts: dict[str, int] = {}
+        for name, n in rows + extra:
+            name = (name or "").strip()
+            if name:
+                counts[name] = counts.get(name, 0) + int(n or 0)
+        return [name for name, _ in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
+
+    cat_rows = db.execute(
+        select(Book.category, func.count(Book.id)).group_by(Book.category)
+    ).all()
+    src_rows = db.execute(
+        select(Book.source, func.count(Book.id)).where(Book.source != "").group_by(Book.source)
+    ).all()
+    shelf_cats = db.execute(
+        select(LegadoShelfBook.kind, func.count(LegadoShelfBook.id))
+        .where(LegadoShelfBook.book_id.is_(None), LegadoShelfBook.kind != "")
+        .group_by(LegadoShelfBook.kind)
+    ).all()
+    shelf_srcs = db.execute(
+        select(LegadoShelfBook.origin_name, func.count(LegadoShelfBook.id))
+        .where(LegadoShelfBook.book_id.is_(None), LegadoShelfBook.origin_name != "")
+        .group_by(LegadoShelfBook.origin_name)
+    ).all()
+    return {
+        "categories": _merged(list(cat_rows), list(shelf_cats)),
+        "sources": _merged(list(src_rows), list(shelf_srcs)),
+    }
+
+
 @router.get("/books")
 def admin_list_books(
     request: Request,
@@ -349,9 +384,9 @@ def admin_list_books(
 
     def _item(b) -> dict:
         item = book_list_item(b, base)
-        # 在线搜索登记的书没有正文：即使客户端裁剪字段也要保留这两个判定位，
-        # 否则前端会把它当成可读的本地书点进空目录
-        item["readable"] = not item.get("online", False)
+        # 在线书也能读（服务端按需抓目录/正文）；判定位即使裁剪字段也保留，
+        # 客户端据此显示在线角标而不是把它当成无正文条目
+        item["readable"] = True
         trimmed = filter_book_fields(item, fields)
         trimmed["online"] = item["online"]
         trimmed["readable"] = item["readable"]
@@ -371,6 +406,94 @@ def admin_get_book(request: Request, book_id: int, db: Session = Depends(get_db)
     if not book:
         raise HTTPException(404, "书籍不存在")
     return admin_book_detail(book, resolve_base_url(request))
+
+
+@router.get("/books/{book_id}/toc")
+def admin_book_toc(
+    book_id: int,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=200, ge=1, le=500),
+    q: str = Query(default="", max_length=50),
+    db: Session = Depends(get_db),
+) -> dict:
+    """详情页目录：服务端分页 + 关键词筛选，避免大部头一次性拉全量。
+
+    空标题/与书名重复的伪占位行不计入目录；q 为数字时同时按章节序号命中。
+    """
+    book = db.get(Book, book_id)
+    if not book:
+        raise HTTPException(404, "书籍不存在")
+    if is_online_book(book):
+        # 与公共目录接口一致：在线书首次访问时同步书源目录
+        try:
+            ensure_toc(db, book)
+        except OnlineReadError as exc:
+            raise HTTPException(502, str(exc)) from exc
+
+    title = func.trim(func.coalesce(Chapter.title, ""))
+    book_title = (book.title or "").strip()
+    base = [Chapter.book_id == book_id, title != ""]
+    if book_title:
+        base.append(title != book_title)
+
+    kw = (q or "").strip()
+    conds = list(base)
+    if kw:
+        esc = kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        matched = title.ilike(f"%{esc}%", escape="\\")
+        # 纯数字：既搜标题也命中该章序号（1 基），与旧版前端过滤行为一致
+        if kw.isdigit() and len(kw) <= 9:
+            matched = or_(matched, Chapter.index == int(kw) - 1)
+        conds.append(matched)
+
+    total = db.execute(
+        select(func.count()).select_from(Chapter).where(*conds)
+    ).scalar_one()
+    book_total = db.execute(
+        select(func.count()).select_from(Chapter).where(*base)
+    ).scalar_one()
+
+    # no = 剔除伪条目后的连续序号，跨页/筛选都稳定，和章节标题编号保持一致
+    ranked = (
+        select(
+            Chapter.id.label("id"),
+            Chapter.index.label("index"),
+            Chapter.title.label("title"),
+            func.row_number().over(order_by=Chapter.index).label("no"),
+        )
+        .where(*base)
+        .subquery()
+    )
+    stmt = select(ranked.c.id, ranked.c.index, ranked.c.title, ranked.c.no)
+    if kw:
+        esc = kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        title_col = func.trim(func.coalesce(ranked.c.title, ""))
+        matched = title_col.ilike(f"%{esc}%", escape="\\")
+        if kw.isdigit() and len(kw) <= 9:
+            matched = or_(matched, ranked.c.index == int(kw) - 1)
+        stmt = stmt.where(matched)
+
+    offset = (page - 1) * page_size
+    rows = db.execute(
+        stmt.order_by(ranked.c.index).offset(offset).limit(page_size)
+    ).all()
+    return {
+        "book_id": book_id,
+        "q": kw,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "book_total": book_total,
+        "items": [
+            {
+                "id": r.id,
+                "index": r.index,
+                "title": r.title or "",
+                "no": int(r.no),
+            }
+            for r in rows
+        ],
+    }
 
 
 @router.get("/books/{book_id}/search")
